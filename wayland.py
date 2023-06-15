@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import os
 import ctypes
 import socket
 import itertools
 
 from xml.etree import ElementTree
+from xml.etree.ElementTree import Element
 
 
 __version__ = 0.1
@@ -86,52 +89,23 @@ class Request:
 
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
-    def _call(self, a, b, c):
-        print("Called!", self, a, b, c)
-
-    __call__ = _call
-
     def __repr__(self):
         argument_names = ', '.join([a.name for a in self.arguments])
         return f"{self.name}({argument_names})"
 
 
-# def make_request(interface, element):
-#
-#     name = element.get('name')
-#     description = getattr(element.find('description'), 'text', "")
-#     summary = element.find('description').get('summary') if description else ""
-#
-#     # arguments = [Argument(self, element) for element in element.findall('arg')]
-#
-#
-#     def call_func(self, a, b, c):
-#         print("Called!", self, a, b, c)
-#
-#     class_dict = {
-#         '__call__': call_func,
-#         'interface': interface,
-#         'name': name,
-#         'description': description,
-#         'summary': summary,
-#     }
-#
-#     return type(name, (), class_dict)()
+class _Interface:
 
+    _protocol: Protocol
+    _element: Element
 
-class Interface:
-    def __init__(self, protocol, element):
+    def __init__(self):
 
-        self._protocol = protocol
-        self._element = element
+        self.name = self._element.get('name')
+        self.version = int(self._element.get('version'), 0)
 
-        self.name = element.get('name')
-        self.version = int(element.get('version'))
-
-        self.description = getattr(element.find('description'), 'text', "")
-        self.summary = element.find('description').get('summary') if self.description else ""
-
-        # TODO: set requests (client -> server) & events (server -> client) as local methods
+        self.description = getattr(self._element.find('description'), 'text', "")
+        self.summary = self._element.find('description').get('summary') if self.description else ""
 
         self.enums = [Enum(self, element) for element in self._element.findall('enum')]
         self.events = [Event(self, element) for element in self._element.findall('event')]
@@ -142,18 +116,25 @@ class Interface:
 
 
 class Protocol:
-    def __init__(self, client: 'Client', filename: str):
+    def __init__(self, client: Client, filename: str):
         self._client = client
         self._root = ElementTree.parse(filename).getroot()
 
         self.name = self._root.get('name')
         self.copyright = getattr(self._root.find('copyright'), 'text', "")
 
-        self._interfaces = [Interface(self, element) for element in self._root.findall('interface') ]
+        self._interface_classes = {}
 
-        # TODO: Keep this? Experiment with direct access:
-        for interface in self._interfaces:
-            setattr(self, interface.name, interface)
+        for element in self._root.findall('interface'):
+            name = element.get('name')
+            self._interface_classes[name] = type(name, (_Interface,), {'_protocol': self, '_element': element})
+
+    def create_interface(self, name):
+        if name not in self._interface_classes:
+            raise NameError(f"This protocol does not define an interfaced named '{name}'.\n"
+                            f"Valid interfaces: {list(self._interface_classes)}")
+
+        return self._interface_classes[name]()
 
     def __repr__(self):
         return f"{self.__class__.__name__}('{self.name}')"
@@ -163,11 +144,11 @@ class Client:
     def __init__(self, *protocols: str):
         """Create a Wayland Client connection.
 
-        :param protocols: one or more protocol xml file paths
-        """
-        # Object ID generator:
-        self._oids = itertools.cycle(range(1, 0xfeffffff))
+        The Client class establishes a connection to the Wayland
+        domain socket.
 
+        :param protocols: one or more protocol xml file paths.
+        """
         endpoint = os.environ.get('WAYLAND_DISPLAY', 'wayland-0')
 
         if os.path.isabs(endpoint):
@@ -190,21 +171,33 @@ class Client:
             protocol = Protocol(client=self, filename=filename)
             setattr(self, f"protocol_{protocol.name}", protocol)
 
-        # A mapping of all live objects:
-        # TODO: store new_id objects here
+        # Client side object ID generator:
+        self._oid_generator = itertools.cycle(range(1, 0xfeffffff))
+
+        # A mapping of oids to interfaces:
         self._objects = {}
 
-    def send(self, data):
+    def get_next_object_id(self) -> int:
+        """Get the next available object ID."""
+        oid = next(self._oid_generator)
+
+        while oid in self._objects:
+            oid = next(self._oid_generator)
+
+        return oid
+
+    def send(self, requests):
+        # TODO
         pass
 
-    def recv(self, length):
+    def recv(self):
+
+        # TODO
         pass
 
     def fileno(self):
+        # Make class selectable:
         return self._sock.fileno()
-
-    def get_object_id(self):
-        return next(self._oids)
 
     def __del__(self):
         if hasattr(self, '_sock'):
