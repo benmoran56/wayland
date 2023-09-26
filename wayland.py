@@ -9,7 +9,7 @@ from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
 
-__version__ = 0.1
+__version__ = 0.2
 
 ##################################
 #  Argument types and structures
@@ -63,12 +63,12 @@ argument_types = {
 
 class Header(ctypes.Structure):
     _pack_ = True
-    _fields_ = [('oid', ctypes.c_uint32),           # size 4
+    _fields_ = [('id', ctypes.c_uint32),            # size 4
                 ('opcode', ctypes.c_uint16),        # size 2
                 ('size', ctypes.c_uint16)]          # size 2
 
     def __repr__(self):
-        return f"Header(id={self.oid}, opcode={self.opcode},  size={self.size})"
+        return f"Header(id={self.oid}, opcode={self.opcode}, size={self.size})"
 
 
 class Argument:
@@ -76,11 +76,19 @@ class Argument:
         self._parent = parent
         self._element = element
 
-        self.type = element.get('type')
         self.name = element.get('name')
 
-        for (key, value) in element.items():
-            setattr(self, key, value)
+        self.type_name = element.get('type')
+        self.type = argument_types[self.type_name]
+        self.interface = element.get('interface')
+        self.summary = element.get('summary')
+
+        # for (key, value) in element.items():
+        #     # setattr(self, key, value)
+        #     print(self.name, f"{key}={value}")
+
+    def __call__(self, value):
+        return bytes(self.type(value))
 
     def __repr__(self):
         return f"{self.name}=({self.type})"
@@ -114,9 +122,10 @@ class Enum:
 
 
 class Event:
-    def __init__(self, interface, element):
+    def __init__(self, interface, element, opcode):
         self._interface = interface
         self._element = element
+        self.opcode = opcode
 
         self.name = element.get('name')
         self.description = getattr(element.find('description'), 'text', "")
@@ -125,13 +134,14 @@ class Event:
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
     def __repr__(self):
-        return f"{self.name}({', '.join((f'{a.name}={a.type}' for a in self.arguments))})"
+        return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class Request:
-    def __init__(self, interface, element):
+    def __init__(self, interface, element, opcode):
         self._interface = interface
         self._element = element
+        self.opcode = opcode
 
         self.name = element.get('name')
         self.description = getattr(element.find('description'), 'text', "")
@@ -140,8 +150,11 @@ class Request:
 
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
+    # def __call__(self, *args, **kwargs):
+    #     print(f"Called {self.name} with {args}, {kwargs}")
+
     def __repr__(self):
-        return f"{self.name}({', '.join((f'{a.name}={a.type}' for a in self.arguments))})"
+        return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class _Interface:
@@ -159,9 +172,19 @@ class _Interface:
         self.description = getattr(self._element.find('description'), 'text', "")
         self.summary = self._element.find('description').get('summary') if self.description else ""
 
-        self.enums = [Enum(self, element) for element in self._element.findall('enum')]
-        self.events = [Event(self, element) for element in self._element.findall('event')]
-        self.requests = [Request(self, element) for element in self._element.findall('request')]
+        # TODO: do enums have opcodes?
+        self._enums = [Enum(self, element) for element in self._element.findall('enum')]
+        self._events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
+        self._requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
+
+        print(f"{self.name}:")
+        for request in self._requests:
+            setattr(self, request.name, request)
+            print(f"  --> {request}")
+
+    # TODO: make interfaces callable
+    def __call__(self, *args, **kwargs):
+        pass
 
     def __repr__(self):
         return f"{self.__class__.__name__}(opcode={self.opcode}, id={self.id})"
@@ -218,6 +241,9 @@ class Client:
 
         :param protocols: one or more protocol xml file paths.
         """
+        assert protocols, ("At a minimum you must provide at least a wayland.xml "
+                           "protocol file, commonly '/usr/share/wayland/wayland.xml'")
+
         endpoint = os.environ.get('WAYLAND_DISPLAY', 'wayland-0')
 
         if os.path.isabs(endpoint):
@@ -232,19 +258,27 @@ class Client:
         self._sock.setblocking(False)
         self._sock.connect(path)
 
+        self.protocols = {}
+
         for filename in protocols:
             if not os.path.exists(filename):
-                raise FileNotFoundError(f"Protocol file not found: {filename}")
+                raise FileNotFoundError(f"Protocol file was not found: {filename}")
 
-            # TODO: Experimental direct access
             protocol = Protocol(client=self, filename=filename)
+            self.protocols[protocol.name] = protocol
+            # TODO: Experimental direct access
             setattr(self, f"protocol_{protocol.name}", protocol)
+
+        assert 'wayland' in self.protocols, "You must provide a wayland.xml protocol file."
 
         # Client side object ID generator:
         self._oid_generator = itertools.cycle(range(1, 0xfeffffff))
 
         # A mapping of oids to interfaces:
         self._objects = {}
+
+        # Create a global display object:
+        self.display = self.protocols['wayland'].create_interface('wl_display', self._get_next_object_id())
 
     def _get_next_object_id(self) -> int:
         """Get the next available object ID."""
@@ -280,12 +314,3 @@ class Client:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(socket='{self._sock.getpeername()}')"
-
-    # Event handlers
-
-
-
-#############################################################
-# DEBUG
-
-client = Client('/usr/share/wayland/wayland.xml')
