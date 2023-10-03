@@ -5,14 +5,17 @@ import ctypes
 import socket
 import itertools
 
+from types import FunctionType
+
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
 
-__version__ = 0.2
+__version__ = 0.3
+
 
 ##################################
-#  Argument types and structures
+#    Data types and structures
 ##################################
 
 class Array(ctypes.Structure):
@@ -49,7 +52,7 @@ class Fixed(ctypes.Structure):
         return f"{self.__class__.__name__}({float(self)})"
 
 
-argument_types = {
+_argument_types = {
     'int':      ctypes.c_int32,
     'uint':     ctypes.c_uint32,
     'fixed':    Fixed,
@@ -68,8 +71,12 @@ class Header(ctypes.Structure):
                 ('size', ctypes.c_uint16)]          # size 2
 
     def __repr__(self):
-        return f"Header(id={self.oid}, opcode={self.opcode}, size={self.size})"
+        return f"Header(id={self.id}, opcode={self.opcode}, size={self.size})"
 
+
+##################################
+#      Wayland abstractions
+##################################
 
 class Argument:
     def __init__(self, parent, element):
@@ -79,7 +86,7 @@ class Argument:
         self.name = element.get('name')
 
         self.type_name = element.get('type')
-        self.type = argument_types[self.type_name]
+        self.type = _argument_types[self.type_name]
         self.interface = element.get('interface')
         self.summary = element.get('summary')
 
@@ -140,6 +147,7 @@ class Event:
 class Request:
     def __init__(self, interface, element, opcode):
         self._interface = interface
+        self._client = interface.protocol.client
         self._element = element
         self.opcode = opcode
 
@@ -150,17 +158,17 @@ class Request:
 
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
-    # def __call__(self, *args, **kwargs):
-    #     print(f"Called {self.name} with {args}, {kwargs}")
+    def __call__(self, *args, **kwargs):
+        print(f"Called {self.name} with {args}, {kwargs}")
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
-class _Interface:
+class _InterfaceBase:
 
-    _protocol: Protocol
     _element: Element
+    protocol: Protocol
     opcode: int
 
     def __init__(self, oid: int):
@@ -177,14 +185,10 @@ class _Interface:
         self._events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
         self._requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
 
-        print(f"{self.name}:")
+        print(f"Interface '{self.name}' defines the following requests:")
         for request in self._requests:
             setattr(self, request.name, request)
             print(f"  --> {request}")
-
-    # TODO: make interfaces callable
-    def __call__(self, *args, **kwargs):
-        pass
 
     def __repr__(self):
         return f"{self.__class__.__name__}(opcode={self.opcode}, id={self.id})"
@@ -192,7 +196,13 @@ class _Interface:
 
 class Protocol:
     def __init__(self, client: Client, filename: str):
-        self._client = client
+        """A representaion of a Wayland Protocol
+
+        Given a Wayland Protocol .xml file, all Interfaces classes will
+        be dynamically generated at runtime.
+        """
+
+        self.client = client
         self._root = ElementTree.parse(filename).getroot()
 
         self.name = self._root.get('name')
@@ -200,18 +210,18 @@ class Protocol:
 
         self._interface_classes = {}
 
-        # Iterate over all interfaces, and dynamically create
-        # custom subclasses using  the _Interface base class.
+        # Iterate over all defined interfaces, and dynamically create
+        # custom Interface classes using the _InterfaceBase class.
         # Opcodes are determined by enumeration order.
-        for opc, element in enumerate(self._root.findall('interface')):
+        for i, element in enumerate(self._root.findall('interface')):
             name = element.get('name')
-            interface_class = type(name, (_Interface,), {'_protocol': self, '_element': element, 'opcode': opc})
+            interface_class = type(name, (_InterfaceBase,), {'protocol': self, '_element': element, 'opcode': i})
             self._interface_classes[name] = interface_class
 
     def create_interface(self, name, oid):
         if name not in self._interface_classes:
-            raise NameError(f"This protocol does not define an interfaced named"
-                            f"'{name}'.\nValid interfaces: {list(self._interface_classes)}")
+            raise NameError(f"This Protocol does not define an interface named '{name}'.\n"
+                            f"Valid interface names are : {list(self._interface_classes)}")
 
         return self._interface_classes[name](oid=oid)
 
@@ -227,22 +237,21 @@ class Client:
     def __init__(self, *protocols: str):
         """Create a Wayland Client connection.
 
-        The Client class establishes a connection to the Wayland
-        domain socket. As per the Wayland specification, the
-        `WAYLAND_DISPLAY` environmental variable is queried for
-        the endpoint name. If this is an absolute path, it is
-        used as-is. If not, the final socket path will be made
-        by joining `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`.
+        The Client class establishes a connection to the Wayland domain socket.
+        As per the Wayland specification, the `WAYLAND_DISPLAY` environmental
+        variable is queried for the endpoint name. If this is an absolute path,
+        it is used as-is. If not, the final socket path will be made by joining
+        `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`.
 
-        The path to at least one Wayland Protocol definition file
-        must be given. These are XML files, generally found under
-        `/usr/share/wayland/`, which are used to generate the
-        interfaces at runtime.
+        The path to at least one Wayland Protocol definition file must be given.
+        These are XML files, generally found under `/usr/share/wayland/`.
+        Wayland Interfaces are generated from the definitions in these Protocol
+        files.
 
         :param protocols: one or more protocol xml file paths.
         """
         assert protocols, ("At a minimum you must provide at least a wayland.xml "
-                           "protocol file, commonly '/usr/share/wayland/wayland.xml'")
+                           "protocol file, commonly '/usr/share/wayland/wayland.xml'.")
 
         endpoint = os.environ.get('WAYLAND_DISPLAY', 'wayland-0')
 
@@ -266,10 +275,11 @@ class Client:
 
             protocol = Protocol(client=self, filename=filename)
             self.protocols[protocol.name] = protocol
-            # TODO: Experimental direct access
+
+            # TODO: Remove these expermentail direct instances:
             setattr(self, f"protocol_{protocol.name}", protocol)
 
-        assert 'wayland' in self.protocols, "You must provide a wayland.xml protocol file."
+        assert 'wayland' in self.protocols, "You must provide at minimum a wayland.xml protocol file."
 
         # Client side object ID generator:
         self._oid_generator = itertools.cycle(range(1, 0xfeffffff))
