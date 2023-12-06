@@ -63,18 +63,6 @@ class Fixed(ctypes.Structure):
         return f"{self.__class__.__name__}({float(self)})"
 
 
-_argument_types = {
-    'int':      ctypes.c_int32,
-    'uint':     ctypes.c_uint32,
-    'fixed':    Fixed,
-    'string':   String,
-    'object':   ctypes.c_uint32,
-    'new_id':   ctypes.c_uint32,
-    'array':    Array,
-    'fd':       ctypes.c_int32
-}
-
-
 class Header(ctypes.Structure):
     _pack_ = True
     _fields_ = [('id', ctypes.c_uint32),        # size 4
@@ -88,42 +76,40 @@ class Header(ctypes.Structure):
         return f"Header(id={self.id}, opcode={self.opcode}, size={self.size})"
 
 
+class _ObjectSpace:
+    pass
+
+
 ##################################
 #      Wayland abstractions
 ##################################
 
 class Argument:
+
+    _argument_types = {
+        'int':      ctypes.c_int32,
+        'uint':     ctypes.c_uint32,
+        'fixed':    Fixed,
+        'string':   String,
+        'object':   ctypes.c_uint32,
+        'new_id':   ctypes.c_uint32,
+        'array':    Array,
+        'fd':       ctypes.c_int32
+    }
+
     def __init__(self, parent, element):
         self._parent = parent
         self._element = element
-
         self.name = element.get('name')
-
         self.type_name = element.get('type')
-        self.type = _argument_types[self.type_name]
+        self.type = self._argument_types[self.type_name]
         self.summary = element.get('summary')
 
-    def __call__(self, value):
+    def __call__(self, value) -> bytes:
         return bytes(self.type(value))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.name}({self.type_name}={self.type.__name__})"
-
-
-class Event:
-    def __init__(self, interface, element, opcode):
-        self._interface = interface
-        self._element = element
-        self.opcode = opcode
-
-        self.name = element.get('name')
-        self.description = getattr(element.find('description'), 'text', "")
-        self.summary = element.find('description').get('summary') if self.description else ""
-
-        self.arguments = [Argument(self, element) for element in element.findall('arg')]
-
-    def __repr__(self):
-        return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class Enum:
@@ -151,6 +137,22 @@ class Enum:
 
     def __repr__(self):
         return f"{self.__class__.__name__}('{self.name}')"
+
+
+class Event:
+    def __init__(self, interface, element, opcode):
+        self._interface = interface
+        self._element = element
+        self.opcode = opcode
+
+        self.name = element.get('name')
+        self.description = getattr(element.find('description'), 'text', "")
+        self.summary = element.find('description').get('summary') if self.description else ""
+
+        self.arguments = [Argument(self, element) for element in element.findall('arg')]
+
+    def __repr__(self):
+        return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class _RequestBase:
@@ -213,22 +215,19 @@ class _InterfaceBase:
         for i, element in enumerate(self._element.findall('request')):
             request_name = element.get('name')
 
-            # Arguments are callable objects that
+            # Arguments are callable objects that type cast and return bytes:
             arguments = [Argument(self, arg) for arg in element.findall('arg')]
 
             # Create a dynamic __call__ method with correct signature:
             signature = "self, " + ", ".join(arg.name for arg in arguments)
             call_string = " + ".join(f"arguments[{i}]({arg.name})" for i, arg in enumerate(arguments))
             source = f"def {request_name}({signature}):\n    return {call_string}"
-
             # Final source code should look something like:
-
+            #
             #   def request_name(self, argument1, argument2):
             #       return arguments[0](argument1) + arguments[1](argument2)
 
-            print(source + '\n')
-
-            logger.debug(source)
+            print(source, '\n')
 
             compiled_code = compile(source=source, filename="<string>", mode="exec")
             method = FunctionType(compiled_code.co_consts[0], locals(), request_name)
@@ -306,12 +305,13 @@ class Client:
         assert protocols, ("At a minimum you must provide at least a wayland.xml "
                            "protocol file, commonly '/usr/share/wayland/wayland.xml'.")
 
-        endpoint = os.environ.get('WAYLAND_DISPLAY', 'wayland-0')
+        endpoint = os.environ.get('WAYLAND_DISPLAY', default='wayland-0')
 
         if os.path.isabs(endpoint):
             path = endpoint
         else:
-            path = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/run/user/1000'), endpoint)
+            _runtime_dir = os.environ.get('XDG_RUNTIME_DIR', default='/run/user/1000')
+            path = os.path.join(_runtime_dir, endpoint)
 
         if not os.path.exists(path):
             raise FileNotFoundError(f"Wayland endpoint not found: {path}")
@@ -320,19 +320,19 @@ class Client:
         self._sock.setblocking(False)
         self._sock.connect(path)
 
-        self.protocols = {}
+        self._protocols = dict()
+        self.protocols = _ObjectSpace()
 
         for filename in protocols:
             if not os.path.exists(filename):
                 raise FileNotFoundError(f"Protocol file was not found: {filename}")
 
             protocol = Protocol(client=self, filename=filename)
-            self.protocols[protocol.name] = protocol
+            self._protocols[protocol.name] = protocol
+            # Temporary addition for easy access in the REPL:
+            setattr(self.protocols, protocol.name, protocol)
 
-            # TODO: Remove these expermentail direct instances:
-            setattr(self, f"protocol_{protocol.name}", protocol)
-
-        assert 'wayland' in self.protocols, "You must provide at minimum a wayland.xml protocol file."
+        assert 'wayland' in self._protocols, "You must provide at minimum a wayland.xml protocol file."
 
         # Client side object ID generator:
         self._oid_generator = _itertools.cycle(range(1, 0xfeffffff))
@@ -355,7 +355,7 @@ class Client:
         return oid
 
     def create_interface(self, protocol: str, interface: str):
-        protocol_class = self.protocols[protocol]
+        protocol_class = self._protocols[protocol]
 
         object_id = self._get_next_object_id()
         interface_instance = protocol_class.create_interface(name=interface, oid=object_id)
