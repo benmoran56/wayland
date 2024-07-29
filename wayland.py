@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import ctypes
 import socket
-import itertools as _itertools
 import logging as _logging
+import itertools as _itertools
 
+from array import array as _array
 from types import FunctionType
+# from inspect import signature, Parameter
 
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
@@ -23,10 +25,11 @@ logger.addHandler(_logging.StreamHandler())
 
 class Array(ctypes.Structure):
     _pack_ = True
-    _fields_ = [('length', ctypes.c_uint32),
-                ('value', ctypes.c_char * 28)]
+    _fields_ = [('length', ctypes.c_uint32),    # size 4
+                ('value', ctypes.c_char * 28)]  # size 28
 
     def __init__(self, text: str):
+        assert len(text) <= 28
         super().__init__(len(text), text.encode())
 
     def __repr__(self):
@@ -34,12 +37,12 @@ class Array(ctypes.Structure):
 
 
 class String(ctypes.Structure):
-    _fields_ = [('length', ctypes.c_uint32),
-                ('value', ctypes.c_char * 27),
-                ('null', ctypes.c_byte)]
+    _fields_ = [('length', ctypes.c_uint32),    # size 4
+                ('value', ctypes.c_char * 27),  # size 27
+                ('null', ctypes.c_byte)]        # size 1
 
     def __init__(self, text: str):
-        # Length including null byte
+        assert len(text) <= 27
         super().__init__(len(text) + 1, text.encode())
 
     def __repr__(self):
@@ -47,7 +50,7 @@ class String(ctypes.Structure):
 
 
 class Fixed(ctypes.Structure):
-    _fields_ = [('_value', ctypes.c_uint)]
+    _fields_ = [('_value', ctypes.c_uint32)]    # size 32
 
     def __init__(self, value):
         v = (int(value) << 8) + int((value % 1.0) * 256)
@@ -69,11 +72,35 @@ class Header(ctypes.Structure):
                 ('opcode', ctypes.c_uint16),    # size 2
                 ('size', ctypes.c_uint16)]      # size 2
 
-    def __add__(self, other):
-        return bytes(self) + other
+    def __add__(self, other: bytes) -> bytes:
+        return bytes(self) + other  # type: ignore
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Header(id={self.id}, opcode={self.opcode}, size={self.size})"
+
+
+_argument_types = {
+    'int':      ctypes.c_int32,
+    'uint':     ctypes.c_uint32,
+    'fixed':    Fixed,
+    'string':   String,
+    'object':   ctypes.c_uint32,
+    'new_id':   ctypes.c_uint32,
+    'array':    Array,
+    'fd':       ctypes.c_int32
+}
+
+
+# _python_types = {
+#     'int':      int,
+#     'uint':     int,
+#     'fixed':    float,
+#     'string':   str,
+#     'object':   int,
+#     'new_id':   int,
+#     'array':    str,
+#     'fd':       int
+# }
 
 
 class _ObjectSpace:
@@ -86,26 +113,18 @@ class _ObjectSpace:
 
 class Argument:
 
-    _argument_types = {
-        'int':      ctypes.c_int32,
-        'uint':     ctypes.c_uint32,
-        'fixed':    Fixed,
-        'string':   String,
-        'object':   ctypes.c_uint32,
-        'new_id':   ctypes.c_uint32,
-        'array':    Array,
-        'fd':       ctypes.c_int32
-    }
-
     def __init__(self, parent, element):
         self._parent = parent
         self._element = element
         self.name = element.get('name')
         self.type_name = element.get('type')
-        self.type = self._argument_types[self.type_name]
+        self.type = _argument_types[self.type_name]
+        # self.python_type = _python_types[self.type_name]
         self.summary = element.get('summary')
 
     def __call__(self, value) -> bytes:
+        # TODO: This tries to convert the argument value (a class) into bytes:
+        print(self.name, value, self.type)
         return bytes(self.type(value))
 
     def __repr__(self) -> str:
@@ -161,6 +180,7 @@ class _RequestBase:
     arguments: list
 
     def __init__(self, interface, element, opcode):
+        self._interface = interface
         self._client = interface.protocol.client
         self.opcode = opcode
 
@@ -168,19 +188,48 @@ class _RequestBase:
         self.description = getattr(element.find('description'), 'text', "")
         self.summary = element.find('description').get('summary') if self.description else ""
 
-    def _send(self, bytestring):
-        # TODO: Complete this method
-
+    def _send(self, bytestring, *fds):
         # Headers are 8 bytes
-        size = 8 + len(bytestring)
-        # header = Header(id=???, opcode=self.opcode, size=size)
-        #
-        # request = header +
-        #
-        # self._client.send_request(self, request, *fds)
+        size = ctypes.sizeof(Header) + len(bytestring)
+
+        header = Header(id=self._interface.id, opcode=self.opcode, size=size)
+
+        request = header + bytestring
+        print(f"{self.name} sent message: {request}, {header}")
+
+        self._client.send_request(self, request, *fds)
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
+
+
+# class Request:
+#
+#     def __init__(self, interface, element, opcode, arguments):
+#         self._client = interface.protocol.client
+#         self.opcode = opcode
+#         self.arguments = arguments
+#
+#         self.name = element.get('name')
+#         self.description = getattr(element.find('description'), 'text', "")
+#         self.summary = element.find('description').get('summary') if self.description else ""
+#
+#     def _send(self, bytestring):
+#         # TODO: Complete this method
+#
+#         # Headers are 8 bytes
+#         size = 8 + len(bytestring)
+#         # header = Header(id=???, opcode=self.opcode, size=size)
+#         #
+#         # request = header +
+#         #
+#         # self._client.send_request(self, request, *fds)
+#
+#     # def __call__(self, *args) -> bytes:
+#     #     return b''.join(self.arguments[i](value) for i, value in enumerate(args))
+#
+#     def __repr__(self):
+#         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class _InterfaceBase:
@@ -201,8 +250,8 @@ class _InterfaceBase:
         self._enums = [Enum(self, element) for element in self._element.findall('enum')]
         self._events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
 
-        for name, request in self._create_requests():
-            setattr(self, name, request)
+        for request in self._create_requests():
+            setattr(self, request.name, request)
 
     def _create_requests(self):
         """Dynamically create `request` methods
@@ -221,13 +270,13 @@ class _InterfaceBase:
             # Create a dynamic __call__ method with correct signature:
             signature = "self, " + ", ".join(arg.name for arg in arguments)
             call_string = " + ".join(f"arguments[{i}]({arg.name})" for i, arg in enumerate(arguments))
-            source = f"def {request_name}({signature}):\n    return {call_string}"
+            source = f"def {request_name}({signature}):\n    self._send({call_string})"
             # Final source code should look something like:
             #
             #   def request_name(self, argument1, argument2):
-            #       return arguments[0](argument1) + arguments[1](argument2)
+            #       self._send(arguments[0](argument1) + arguments[1](argument2))
 
-            print(source, '\n')
+            # print(source, '\n')
 
             compiled_code = compile(source=source, filename="<string>", mode="exec")
             method = FunctionType(compiled_code.co_consts[0], locals(), request_name)
@@ -235,7 +284,19 @@ class _InterfaceBase:
             # Create a dynamic Request class which includes the custom __call__ method:
             request_class = type(request_name, (_RequestBase,), {'__call__': method, 'arguments': arguments})
 
-            yield request_name, request_class(interface=self, element=element, opcode=i)
+            yield request_class(interface=self, element=element, opcode=i)
+
+            # def _call(self, *args) -> bytes:
+            #     return b''.join(self.arguments[_i](value) for _i, value in enumerate(args))
+            #
+            # # request = Request(interface=self, element=element, opcode=i, arguments=arguments)
+            # request_class = type(request_name, (Request,), {'__call__': _call})
+            #
+            # sig = signature(_call)
+            # parameters = [Parameter(name=arg.name, kind=Parameter.VAR_POSITIONAL) for arg in arguments]
+            # _call.__signature__ = sig.replace(parameters=parameters)
+            #
+            # yield request_class(interface=self, element=element, opcode=i, arguments=arguments)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(opcode={self.opcode}, id={self.id})"
@@ -364,9 +425,7 @@ class Client:
         return interface_instance
 
     def send_request(self, request, *fds):
-        # TODO: finish this
-        import array
-        self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+        self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, _array("i", fds))])
 
     def fileno(self):
         """The fileno of the socket object
@@ -379,7 +438,8 @@ class Client:
     def select(self):
         # TODO: receive events from the server
         # (data, ancdata, msg_flags, address)
-        data, ancdata, msg_flags, _ = self._sock.recvmsg(1024, socket.CMSG_SPACE(16 * 4))
+        data, ancdata, msg_flags, _ = self._sock.recvmsg(1024, socket.CMSG_SPACE(64))
+        print("data, ancdata, msg_flags: ", data, ancdata, msg_flags)
 
     def __del__(self):
         if hasattr(self, '_sock'):
@@ -387,3 +447,8 @@ class Client:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(socket='{self._sock.getpeername()}')"
+
+
+# TODO: remove testing code:
+if __name__ == '__main__':
+    client = Client('/usr/share/wayland/wayland.xml')
