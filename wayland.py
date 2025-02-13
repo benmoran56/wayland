@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import abc
 import os
-import ctypes
+import abc
 import socket
 import struct
 import itertools as _itertools
@@ -14,7 +13,7 @@ from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
 
-__version__ = 0.5
+__version__ = 0.6
 
 
 def _debug_wayland(message: str) -> bool:
@@ -29,109 +28,143 @@ assert _debug_wayland(f"version: {__version__}")
 #    Data types and structures
 ##################################
 
-class Int(ctypes.c_int32):
-    length = ctypes.sizeof(ctypes.c_int32)
+class WaylandType(abc.ABC):
+    length: int
+    value: int | float | str | bytes
 
-
-class Uint(ctypes.c_uint32):
-    length = ctypes.sizeof(ctypes.c_uint32)
-
-
-class Fixed(ctypes.Structure):
-    _fields_ = [('_value', ctypes.c_uint32)]    # size 32
-
-    def __init__(self, value):
-        v = (int(value) << 8) + int((value % 1.0) * 256)
-        super().__init__(v)
-
-    @property
-    def value(self):
-        return (self._value >> 8) + (self._value & 0xff) / 256.0
-
-    def __int__(self):
-        return int(self.value)
-
-    def __float__(self):
-        return self.value
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({float(self)})"
-
-
-class String:
-    def __init__(self, text: str):
-        self.length = len(text) + (-len(text) % 4)
-        self.value = text.split('\x00')[0]      # Split at null termination value
+    @abc.abstractmethod
+    def to_bytes(self) -> bytes:
+        ...
 
     @classmethod
-    def from_buffer_copy(cls, buffer: bytes):
-        length = struct.unpack('I', buffer[:4])[0]      # 32-bit integer
-        text = buffer[4:].decode()
-        return cls(text)
+    @abc.abstractmethod
+    def from_bytes(cls, buffer: bytes) -> WaylandType:
+        ...
 
-    def __bytes__(self):
+    def __repr__(self):
+        return f"{self.__class__.__name__}(length={self.length}, value={self.value})"
+
+
+class Int(WaylandType):
+    length = struct.calcsize('i')
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def to_bytes(self) -> bytes:
+        return struct.pack('i', self.value)
+
+    @classmethod
+    def from_bytes(cls, buffer: bytes) -> Int:
+        return cls(struct.unpack('i', buffer[:cls.length])[0])
+
+
+class UInt(WaylandType):
+    length = struct.calcsize('I')
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def to_bytes(self) -> bytes:
+        return struct.pack('I', self.value)
+
+    @classmethod
+    def from_bytes(cls, buffer: bytes) -> UInt:
+        return cls(struct.unpack('I', buffer[:cls.length])[0])
+
+class Fixed(WaylandType):
+    length = struct.calcsize('I')
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def to_bytes(self) -> bytes:
+        return struct.pack('I', (int(self.value) << 8) + int((self.value % 1.0) * 256))
+
+    @classmethod
+    def from_bytes(cls, buffer: bytes) -> Fixed:
+        unpacked = struct.unpack('I', buffer[:cls.length])[0]
+        return cls((unpacked >> 8) + (unpacked & 0xff) / 256.0)
+
+
+class String(WaylandType):
+    def __init__(self, text: str):
+        # length uint + text length + 4byte padding
+        self.length = 4 + len(text) + (-len(text) % 4)
+        self.value = text
+
+    def to_bytes(self) -> bytes:
         length = len(self.value) + 1
         padding = (4 - (length % 4))
         encoded = self.value.encode() + b'\x00'
         return struct.pack('I', length) + encoded.ljust(padding, b'\x00')
 
-    def __add__(self, other: bytes):
-        return bytes(self) + other
+    @classmethod
+    def from_bytes(cls, buffer: bytes) -> String:
+        length = struct.unpack('I', buffer[:4])[0]      # 32-bit integer
+        text = buffer[4:4+length-1].decode()
+        return cls(text)
 
-    def __radd__(self, other: bytes):
-        return other + bytes(self)
+
+class Array(WaylandType):
+    def __init__(self, array: bytes):
+        # length uint + text length + 4byte padding
+        self.length = 4 + len(array) + (-len(array) % 4)
+        self.value = array
+
+    def to_bytes(self) -> bytes:
+        length = len(self.value)
+        padding_size = (4 - (length % 4))
+        return struct.pack('I', length) + b'\x00' * padding_size
+
+    @classmethod
+    def from_bytes(cls, buffer: bytes) -> Array:
+        length = struct.unpack('I', buffer[:4])[0]      # 32-bit integer
+        array = buffer[4:4+length]
+        return cls(array)
+
+
+class Header(WaylandType):
+    length = struct.calcsize('IHH')
+
+    def __init__(self, oid, opcode, size):
+        self.oid = oid
+        self.opcode = opcode
+        self.size = size
+        self.value = struct.pack('IHH', oid, opcode, size)
+
+    def to_bytes(self) -> bytes:
+        return self.value
+
+    @classmethod
+    def from_bytes(cls, buffer) -> Header:
+        return cls(*struct.unpack('IHH', buffer))
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(len={self.length}, value='{self.value}')"
+        return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode}, size={self.size})"
 
 
-class Object(ctypes.c_uint32):
-    length = ctypes.sizeof(ctypes.c_uint32)
+class Object(UInt):
+    pass
 
 
-class NewID(ctypes.c_uint32):
-    length = ctypes.sizeof(ctypes.c_uint32)
+class NewID(UInt):
+    pass
 
 
-class Array(ctypes.Structure):
-    _pack_ = True
-    _fields_ = [('length', ctypes.c_uint32),    # size 4
-                ('value', ctypes.c_char * 28)]  # size 28
-
-    def __init__(self, text: str):
-        assert len(text) <= 28
-        super().__init__(len(text), text.encode())
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(len={self.length}, text='{self.value.decode()}')"
-
-
-class FD(ctypes.c_int32):
-    length = ctypes.sizeof(ctypes.c_int32)
-
-
-class Header(ctypes.Structure):
-    _pack_ = True
-    _fields_ = [('id', ctypes.c_uint32),        # size 4
-                ('opcode', ctypes.c_uint16),    # size 2
-                ('size', ctypes.c_uint16)]      # size 2
-
-    def __add__(self, other: bytes) -> bytes:
-        return bytes(self) + other  # type: ignore
-
-    def __repr__(self) -> str:
-        return f"Header(id={self.id}, opcode={self.opcode}, size={self.size})"
+class FD(Int):
+    pass
 
 
 _argument_types = {
     'int':      Int,
-    'uint':     Uint,
+    'uint':     UInt,
     'fixed':    Fixed,
     'string':   String,
     'object':   Object,
     'new_id':   NewID,
     'array':    Array,
-    'fd':       FD
+    'fd':       FD,
 }
 
 
@@ -151,14 +184,16 @@ class Argument:
         self.name = element.get('name')
         self.summary = element.get('summary')
         self.type_name = element.get('type')
-        self.ctype = _argument_types[self.type_name]
-        self.ctype_name = self.ctype.__name__
+        self.wl_type = _argument_types[self.type_name]
 
     def __call__(self, value) -> bytes:
-        return bytes(self.ctype(value))
+        return self.wl_type(value).to_bytes()
+
+    def from_bytes(self, buffer: bytes) -> WaylandType:
+        return self.wl_type.from_bytes(buffer)
 
     def __repr__(self) -> str:
-        return f"{self.name}({self.type_name}={self.ctype.__name__})"
+        return f"{self.name}({self.type_name}={self.wl_type.__name__})"
 
 
 class Enum:
@@ -201,20 +236,18 @@ class Event:
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
     def __call__(self, payload):
-        processed_args = []
+        decoded_values = []
 
         for arg in self.arguments:
-            # print(f"   {arg.name} starting payload: {payload}")
-            c_type_instance = arg.ctype.from_buffer_copy(payload)
-            # print(f"   Processed: {c_type_instance, c_type_instance.value, c_type_instance.length}")
-            processed_args.append(c_type_instance.value)
+            wl_type = arg.wl_type.from_bytes(payload)
+            decoded_values.append(wl_type.value)
+            # trim, and continue loop:
+            payload = payload[wl_type.length:]
 
-            # Cut off the processed
-            payload = payload[c_type_instance.length:]
+        # TODO: add event dispatcher to Client
+        signature = tuple(f"{arg.name}={value}" for arg, value in zip(self.arguments, decoded_values))
+        print(f"Event({self.name}), arguments={signature}")
 
-        print(f"Event({self.name}), processed data: {processed_args}")
-        # results = [sa.ctype.from_buffer_copy(a) for sa in self.arguments for a in args]
-        # print(f"{self.name}, args: {results}")
 
     def __repr__(self):
         args = ', '.join((f'{a.name}={a.type_name}' for a in self.arguments))
@@ -236,42 +269,41 @@ class _RequestBase:
         self.summary = element.find('description').get('summary') if self.description else ""
 
     def _send(self, bytestring, *fds):
-        # Headers are 8 bytes
-        size = ctypes.sizeof(Header) + len(bytestring)
-        header = Header(id=self._interface.id, opcode=self.opcode, size=size)
-        request = header + bytestring
-        self._client.send_request(request, *fds)
-
-
-    def __repr__(self):
-        return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
-
-
-class Request:
-
-    def __init__(self, interface, element, opcode):
-        self._interface = interface
-        self._client = interface.protocol.client
-        self.opcode = opcode
-
-        self.name = element.get('name')
-        self.description = getattr(element.find('description'), 'text', "")
-        self.summary = element.find('description').get('summary') if self.description else ""
-
-        self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
-
-    def _send(self, bytestring, *fds):
-        # Headers are 8 bytes
-        size = ctypes.sizeof(Header) + len(bytestring)
-        header = Header(id=self._interface.id, opcode=self.opcode, size=size)
-        request = header + bytestring
-        self._client.send_request(request, *fds)
-
-    def __call__(self, *args) -> bytes:
-        return b''.join(self.arguments[i](value) for i, value in enumerate(args))
+        size = Header.length + len(bytestring)
+        header = Header(oid=self._interface.id, opcode=self.opcode, size=size)
+        request = header.to_bytes() + bytestring
+        fds = b''.join(fd.to_bytes() for fd in fds)
+        self._client.send_request(request, fds)
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
+
+
+# class Request:
+#
+#     def __init__(self, interface, element, opcode):
+#         self._interface = interface
+#         self._client = interface.protocol.client
+#         self.opcode = opcode
+#
+#         self.name = element.get('name')
+#         self.description = getattr(element.find('description'), 'text', "")
+#         self.summary = element.find('description').get('summary') if self.description else ""
+#
+#         self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
+#
+#     def _send(self, bytestring, *fds):
+#         size = Header.length + len(bytestring)
+#         header = Header(oid=self._interface.id, opcode=self.opcode, size=size)
+#         request = header.to_bytes() + bytestring
+#         fds = b''.join(fd.to_bytes() for fd in fds)
+#         self._client.send_request(request, fds)
+#
+#     def __call__(self, *args) -> bytes:
+#         return b''.join(self.arguments[i](value) for i, value in enumerate(args))
+#
+#     def __repr__(self):
+#         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
 class _InterfaceBase:
@@ -290,8 +322,9 @@ class _InterfaceBase:
 
         self.enums = [Enum(self, element) for element in self._element.findall('enum')]
         self.events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
+
         # TODO: figure out these requests
-        self._requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
+        # self._requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
         # TODO: or do like this?
         for request in self._create_requests():
             setattr(self, request.name, request)
@@ -407,7 +440,7 @@ class Client:
     When instantiated, the Client automatically creates the main Display
     (`wl_display`) interface, which is available as `Client.wl_display`.
     """
-    def __init__(self, *protocols: str):
+    def __init__(self, *protocols: str) -> None:
         """Create a Wayland Client connection.
 
         :param protocols: one or more protocol xml file paths.
@@ -431,6 +464,7 @@ class Client:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
         self._sock.setblocking(False)
         self._sock.connect(path)
+        self._recv_buffer = b""
 
         assert _debug_wayland(f"connected to: {self._sock.getpeername()}")
 
@@ -466,10 +500,10 @@ class Client:
 
         return oid
 
-    def send_request(self, request, *fds):
-        self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, _array("i", fds))])
+    def send_request(self, request: bytes, fds: bytes) -> None:
+        self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
 
-    def fileno(self):
+    def fileno(self) -> int:
         """The fileno of the socket object
 
         This method exists to allow the class
@@ -477,19 +511,50 @@ class Client:
         """
         return self._sock.fileno()
 
-    def select(self):
-        # TODO: receive events from the server
-        # (data, ancdata, msg_flags, address)
-        data, ancdata, msg_flags, _ = self._sock.recvmsg(1024, socket.CMSG_SPACE(64), socket.MSG_WAITALL)
+    def recv(self) -> None:
+        _header_len = Header.length
 
-    def __del__(self):
+        try:
+            new_data, ancdata, msg_flags, _ = self._sock.recvmsg(4096, socket.CMSG_SPACE(64))
+        except BlockingIOError:
+            return
+
+        # Include any leftover partial data:
+        data = self._recv_buffer + new_data
+
+        # Parse the events in chunks:
+        while len(data) > _header_len:
+
+            # The first part of the data is the header:
+            header = Header.from_bytes(data[:_header_len])
+
+            # Do we have enough data for the full message?
+            if len(data) < header.size:
+                break
+
+            # - find the matching object (interface) from the header.oid
+            # - find the matching event by its header.opcode
+            # - pass the raw payload into the event, which will decode it
+            interface = self.objects[header.oid]
+            event = interface.events[header.opcode]
+            event(data[_header_len:header.size])
+
+            # trim, and continue loop
+            data = data[header.size:]
+
+        # Keep leftover for next time:
+        self._recv_buffer = data
+
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            print("Unhandled ancillary data")
+            # TODO: handle file descriptors and stuff
+
+    def poll(self) -> None:
+        self.recv()
+
+    def __del__(self) -> None:
         if hasattr(self, '_sock'):
             self._sock.close()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.__class__.__name__}(socket='{self._sock.getpeername()}')"
-
-
-# TODO: remove testing code:
-if __name__ == '__main__':
-    client = Client('/usr/share/wayland/wayland.xml')
