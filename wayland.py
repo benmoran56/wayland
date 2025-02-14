@@ -22,6 +22,36 @@ def _debug_wayland(message: str) -> bool:
 
 assert _debug_wayland(f"version: {__version__}")
 
+##################################
+#       Event Dispatching
+##################################
+
+class EventDispatcher:
+
+    _handlers = {}
+    event_types = []
+
+    def dispatch_event(self, name, *args):
+        for handler in self._handlers.get(name, []):
+            handler(*args)
+
+    def set_handler(self, name, handler):
+        handlers = self._handlers.get(name, [])
+        handlers.append(handler)
+        self._handlers[name] = handlers
+
+    def remove_handler(self, name, handler):
+        if handlers := self._handlers.get(name):
+            if handler in handlers:
+                handlers.remove(handler)
+
+##################################
+#          Exceptions
+##################################
+
+class WaylandServerError(OSError):
+    ...
+
 
 ##################################
 #       Wayland data types
@@ -196,6 +226,13 @@ class Argument:
         return f"{self.name}({self.type_name}={self.wl_type.__name__})"
 
 
+class Entry:
+    def __init__(self, element):
+        self.name = element.get('name')
+        self.value = int(element.get('value'), base=0)
+        self.summary = element.get('summary')
+
+
 class Enum:
     def __init__(self, interface, element):
         self._interface = interface
@@ -204,20 +241,10 @@ class Enum:
         self.name = element.get('name')
         self.description = getattr(element.find('description'), 'text', "")
         self.summary = element.find('description').get('summary') if self.description else ""
-
         self.bitfield = element.get('bitfield', 'false')
 
-        self._entries = {}
-        self._summaries = {}
-
-        for entry in element.findall('entry'):
-            name = entry.get('name')
-            value = int(entry.get('value'), base=0)
-            summary = entry.get('summary')
-            self._entries[value] = name
-            self._summaries[name] = summary
-
-        # TODO: item access, including bitfield
+        self.entries = [Entry(element) for element in self._element.findall('entry')]
+        self.entries.sort(key=lambda e: e.value)
 
     def __repr__(self):
         return f"{self.__class__.__name__}('{self.name}')"
@@ -246,7 +273,7 @@ class Event:
 
         # signature = tuple(f"{arg.name}={value}" for arg, value in zip(self.arguments, decoded_values))
         # print(f"Event({self.name}), arguments={signature}")
-        self._interface.dispatch_event(self, *decoded_values)
+        self._interface.dispatch_event(self.name, *decoded_values)
 
     def __repr__(self):
         args = ', '.join((f'{a.name}={a.type_name}' for a in self.arguments))
@@ -307,7 +334,7 @@ class Request:
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
-class InterfaceBase:
+class InterfaceBase(EventDispatcher):
     """Interface base class"""
 
     _element: Element
@@ -324,11 +351,12 @@ class InterfaceBase:
 
         self.enums = [Enum(self, element) for element in self._element.findall('enum')]
         self.events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
+        self.event_types = [event.name for event in self.events]
 
         # TODO: figure out these requests
-        self.requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
-        # TODO: or do like this?
-        for request in self._create_requests():
+        # self.requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
+        self.requests = list(self._create_requests())
+        for request in self.requests:
             setattr(self, request.name, request)
 
     def _create_requests(self):
@@ -378,9 +406,6 @@ class InterfaceBase:
             #
             # yield request_class(interface=self, element=element, opcode=i)
 
-    def dispatch_event(self, name, *args):
-        print(f"{self.name} {name}, arguments={args}")
-
     def __repr__(self):
         return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode})"
 
@@ -417,7 +442,7 @@ class Protocol:
             self._interface_classes[name] = interface_class
             assert _debug_wayland(f"   * found interface: '{name}'")
 
-    def create_interface(self, name: str, oid: int | None = None) -> InterfaceBase:
+    def create_interface(self, name: str, oid: int | None = None):
         """Create an Interface instance by name.
 
         Args:
@@ -518,8 +543,16 @@ class Client:
 
         assert 'wayland' in self.protocol_dict, "You must provide at minimum a wayland.xml protocol file."
 
-        # Create global Wayland objects:
-        self.wl_display = self.protocol_dict['wayland'].create_interface('wl_display')
+        # Create global display interface:
+        self.wl_display = self.protocol_dict['wayland'].create_interface(name='wl_display')
+        self.wl_display.set_handler('error', self._wl_display_error_handler)
+        self.wl_display.set_handler('delete_id', self._wl_display_delete_id_handler)
+
+        # Create global registry:
+        self.wl_registry = self.protocol_dict['wayland'].create_interface(name='wl_registry')
+        self.wl_display.set_handler('global', self._wl_registry_global)
+        self.wl_display.set_handler('global_remove', self._wl_registry_global_remove)
+        self.wl_display.get_registry(self.wl_registry.oid)
 
     def fileno(self) -> int:
         """The fileno of the internal socket.
@@ -592,3 +625,18 @@ class Client:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(socket='{self._sock.getpeername()}')"
+
+    # Event handlers
+
+    def _wl_display_delete_id_handler(self, oid):
+        self.protocol_dict['wayland'].delete_interface(oid)
+
+    def _wl_display_error_handler(self, oid: int, code: int, message: str):
+        # TODO: map this to the right interface/enum/entry
+        print("ERROR callback: ", oid, code, message)
+
+    def _wl_registry_global(self, *args):
+        print("registry global callback: ", *args)
+
+    def _wl_registry_global_remove(self, *args):
+        print("registry global_remove callback: ", *args)
