@@ -6,7 +6,6 @@ import socket
 import struct
 import itertools as _itertools
 
-from array import array as _array
 from types import FunctionType
 
 from xml.etree import ElementTree
@@ -25,7 +24,7 @@ assert _debug_wayland(f"version: {__version__}")
 
 
 ##################################
-#    Data types and structures
+#       Wayland data types
 ##################################
 
 class WaylandType(abc.ABC):
@@ -71,6 +70,7 @@ class UInt(WaylandType):
     @classmethod
     def from_bytes(cls, buffer: bytes) -> UInt:
         return cls(struct.unpack('I', buffer[:cls.length])[0])
+
 
 class Fixed(WaylandType):
     length = struct.calcsize('I')
@@ -156,7 +156,7 @@ class FD(Int):
     pass
 
 
-_argument_types = {
+_type_map = {
     'int':      Int,
     'uint':     UInt,
     'fixed':    Fixed,
@@ -184,7 +184,7 @@ class Argument:
         self.name = element.get('name')
         self.summary = element.get('summary')
         self.type_name = element.get('type')
-        self.wl_type = _argument_types[self.type_name]
+        self.wl_type = _type_map[self.type_name]
 
     def __call__(self, value) -> bytes:
         return self.wl_type(value).to_bytes()
@@ -244,17 +244,16 @@ class Event:
             # trim, and continue loop:
             payload = payload[wl_type.length:]
 
-        # TODO: add event dispatcher to Client
-        signature = tuple(f"{arg.name}={value}" for arg, value in zip(self.arguments, decoded_values))
-        print(f"Event({self.name}), arguments={signature}")
-
+        # signature = tuple(f"{arg.name}={value}" for arg, value in zip(self.arguments, decoded_values))
+        # print(f"Event({self.name}), arguments={signature}")
+        self._interface.dispatch_event(self, *decoded_values)
 
     def __repr__(self):
         args = ', '.join((f'{a.name}={a.type_name}' for a in self.arguments))
         return f"{self.__class__.__name__}(name={self.name}, opcode={self.opcode}, args=({args}))"
 
 
-class _RequestBase:
+class RequestBase:
     """Request base class"""
 
     arguments: list
@@ -262,6 +261,7 @@ class _RequestBase:
     def __init__(self, interface, element, opcode):
         self._interface = interface
         self._client = interface.protocol.client
+        self.oid = self._interface.oid
         self.opcode = opcode
 
         self.name = element.get('name')
@@ -270,43 +270,44 @@ class _RequestBase:
 
     def _send(self, bytestring, *fds):
         size = Header.length + len(bytestring)
-        header = Header(oid=self._interface.id, opcode=self.opcode, size=size)
+        header = Header(oid=self.oid, opcode=self.opcode, size=size)
         request = header.to_bytes() + bytestring
         fds = b''.join(fd.to_bytes() for fd in fds)
-        self._client.send_request(request, fds)
+        self._client.send(request, fds)
+
+    def __repr__(self):
+        return f"{self.name}(opcode={self.opcode}, args=({', '.join((f'{a}' for a in self.arguments))}))"
+
+
+class Request:
+
+    def __init__(self, interface, element, opcode):
+        self._interface = interface
+        self._client = interface.protocol.client
+        self.oid = self._interface.oid
+        self.opcode = opcode
+
+        self.name = element.get('name')
+        self.description = getattr(element.find('description'), 'text', "")
+        self.summary = element.find('description').get('summary') if self.description else ""
+
+        self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
+
+    def _send(self, bytestring, *fds):
+        size = Header.length + len(bytestring)
+        header = Header(oid=self.oid, opcode=self.opcode, size=size)
+        request = header.to_bytes() + bytestring
+        fds = b''.join(fd.to_bytes() for fd in fds)
+        self._client.send(request, fds)
+
+    def __call__(self, *args) -> bytes:
+        return b''.join(self.arguments[i](value) for i, value in enumerate(args))
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
 
 
-# class Request:
-#
-#     def __init__(self, interface, element, opcode):
-#         self._interface = interface
-#         self._client = interface.protocol.client
-#         self.opcode = opcode
-#
-#         self.name = element.get('name')
-#         self.description = getattr(element.find('description'), 'text', "")
-#         self.summary = element.find('description').get('summary') if self.description else ""
-#
-#         self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
-#
-#     def _send(self, bytestring, *fds):
-#         size = Header.length + len(bytestring)
-#         header = Header(oid=self._interface.id, opcode=self.opcode, size=size)
-#         request = header.to_bytes() + bytestring
-#         fds = b''.join(fd.to_bytes() for fd in fds)
-#         self._client.send_request(request, fds)
-#
-#     def __call__(self, *args) -> bytes:
-#         return b''.join(self.arguments[i](value) for i, value in enumerate(args))
-#
-#     def __repr__(self):
-#         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
-
-
-class _InterfaceBase:
+class InterfaceBase:
     """Interface base class"""
 
     _element: Element
@@ -314,7 +315,8 @@ class _InterfaceBase:
     opcode: int
 
     def __init__(self, oid: int):
-        self.id = oid
+        self.oid = oid
+        self.name = self._element.get('name')
         self.version = int(self._element.get('version'), 0)
 
         self.description = getattr(self._element.find('description'), 'text', "")
@@ -324,7 +326,7 @@ class _InterfaceBase:
         self.events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
 
         # TODO: figure out these requests
-        # self._requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
+        self.requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
         # TODO: or do like this?
         for request in self._create_requests():
             setattr(self, request.name, request)
@@ -360,7 +362,7 @@ class _InterfaceBase:
             method = FunctionType(compiled_code.co_consts[0], locals(), request_name)
 
             # Create a dynamic Request class which includes the custom __call__ method:
-            request_class = type(request_name, (_RequestBase,), {'__call__': method, 'arguments': arguments})
+            request_class = type(request_name, (RequestBase,), {'__call__': method, 'arguments': arguments})
 
             yield request_class(interface=self, element=element, opcode=i)
 
@@ -374,18 +376,28 @@ class _InterfaceBase:
             # parameters = [Parameter(name=arg.name, kind=Parameter.VAR_POSITIONAL) for arg in arguments]
             # _call.__signature__ = sig.replace(parameters=parameters)
             #
-            # yield request_class(interface=self, element=element, opcode=i, arguments=arguments)
+            # yield request_class(interface=self, element=element, opcode=i)
+
+    def dispatch_event(self, name, *args):
+        print(f"{self.name} {name}, arguments={args}")
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(opcode={self.opcode}, id={self.id})"
+        return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode})"
 
 
 class Protocol:
     def __init__(self, client: Client, filename: str):
-        """A representation of a Wayland Protocol
+        """A Wayland Protocol
 
-        Given a Wayland Protocol .xml file, all Interfaces classes will
-        be dynamically generated at runtime.
+        Given a Wayland Protocol .xml file, this class will dynamically
+        introspect and define custom classes for all Interfaces defined
+        within. This class should not be instantiated directly. It will
+        automatically be created as part of a :py:class:`~wayland.Client`
+        instance.
+
+        Args:
+            client: The parent Client to which this Protocol belongs.
+            filename: The .xml file that contains the Protocol definition.
         """
 
         self.client = client
@@ -397,29 +409,47 @@ class Protocol:
 
         self._interface_classes = {}
 
-        # Iterate over all defined interfaces, and dynamically create custom Interface
+        # Iterate over all defined interfaces and dynamically create custom Interface
         # classes using the _InterfaceBase class. Opcodes are determined by enumeration order.
         for i, element in enumerate(self._root.findall('interface')):
             name = element.get('name')
-            interface_class = type(name, (_InterfaceBase,), {'protocol': self, '_element': element, 'opcode': i})
+            interface_class = type(name, (InterfaceBase,), {'protocol': self, '_element': element, 'opcode': i})
             self._interface_classes[name] = interface_class
             assert _debug_wayland(f"   * found interface: '{name}'")
 
-    def create_interface(self, name, oid):
+    def create_interface(self, name: str, oid: int | None = None) -> InterfaceBase:
+        """Create an Interface instance by name.
+
+        Args:
+            name: The Interface name.
+            oid: If not provided, an oid will be generated by the Client.
+
+        Returns: an Interface instance.
+        """
         if name not in self._interface_classes:
             raise NameError(f"The '{self.name}' Protocol does not define an interface named '{name}'")
 
-        assert _debug_wayland(f"{self}: creating Interface '{name}' with oid={oid}")
+        oid = oid or self.client.get_next_oid()
         interface = self._interface_classes[name](oid=oid)
         self.client.objects[oid] = interface
+        assert _debug_wayland(f"{self}: created {interface}")
         return interface
 
+    def delete_interface(self, oid: int) -> None:
+        """Delete an Interface, by its oid.
+
+        Args:
+            oid: The object ID (oid) of the interface.
+        """
+        interface = self.client.objects.pop(oid)
+        self.client.oid_pool.append(oid)   # to reuse later
+        assert _debug_wayland(f"{self}: deleted {interface}")
 
     @property
-    def interface_names(self):
+    def interface_names(self) -> list[str]:
         return list(self._interface_classes)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.__class__.__name__}('{self.name}')"
 
 
@@ -470,6 +500,7 @@ class Client:
 
         # Client side object ID generator:
         self._oid_generator = _itertools.cycle(range(1, 0xfeffffff))
+        self.oid_pool = []
 
         # A mapping of oids to interfaces:
         self.objects = {}
@@ -487,12 +518,22 @@ class Client:
 
         assert 'wayland' in self.protocol_dict, "You must provide at minimum a wayland.xml protocol file."
 
-        # Create a global wl_display object:
-        next_id = self.get_next_object_id()
-        self.wl_display = self.protocol_dict['wayland'].create_interface('wl_display', oid=next_id)
+        # Create global Wayland objects:
+        self.wl_display = self.protocol_dict['wayland'].create_interface('wl_display')
 
-    def get_next_object_id(self) -> int:
-        """Get the next available (unused) object ID"""
+    def fileno(self) -> int:
+        """The fileno of the internal socket.
+
+        This method exists to allow the class
+        to be "selectable" (see the ``select`` module).
+        """
+        return self._sock.fileno()
+
+    def get_next_oid(self) -> int:
+        """Get the next available or recycled object ID (oid)."""
+        if self.oid_pool:
+            return self.oid_pool.pop()
+
         oid = next(self._oid_generator)
 
         while oid in self.objects:
@@ -500,18 +541,11 @@ class Client:
 
         return oid
 
-    def send_request(self, request: bytes, fds: bytes) -> None:
+    def send(self, request: bytes, fds: bytes) -> None:
         self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
 
-    def fileno(self) -> int:
-        """The fileno of the socket object
-
-        This method exists to allow the class
-        to be "selectable" (see the ``select`` module).
-        """
-        return self._sock.fileno()
-
-    def recv(self) -> None:
+    def receive(self) -> None:
+        """Receive Events from the server."""
         _header_len = Header.length
 
         try:
@@ -550,7 +584,7 @@ class Client:
             # TODO: handle file descriptors and stuff
 
     def poll(self) -> None:
-        self.recv()
+        self.receive()
 
     def __del__(self) -> None:
         if hasattr(self, '_sock'):
