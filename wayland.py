@@ -5,6 +5,9 @@ import abc
 import socket
 import struct
 import itertools as _itertools
+import threading as _threading
+
+from collections import namedtuple as _namedtuple
 
 from types import FunctionType
 
@@ -16,7 +19,7 @@ __version__ = 0.6
 
 
 def _debug_wayland(message: str) -> bool:
-    print(message)
+    print(f"wl:  {message}")
     return True
 
 
@@ -226,11 +229,7 @@ class Argument:
         return f"{self.name}({self.type_name}={self.wl_type.__name__})"
 
 
-class Entry:
-    def __init__(self, element):
-        self.name = element.get('name')
-        self.value = int(element.get('value'), base=0)
-        self.summary = element.get('summary')
+Entry = _namedtuple('Entry', 'name, value, summary')
 
 
 class Enum:
@@ -243,7 +242,7 @@ class Enum:
         self.summary = element.find('description').get('summary') if self.description else ""
         self.bitfield = element.get('bitfield', 'false')
 
-        self.entries = [Entry(element) for element in self._element.findall('entry')]
+        self.entries = [Entry(e.get('name'), e.get('value'), e.get('summary')) for e in self._element.findall('entry')]
         self.entries.sort(key=lambda e: e.value)
 
     def __repr__(self):
@@ -430,7 +429,7 @@ class Protocol:
 
         self.name = self._root.get('name')
         self.copyright = getattr(self._root.find('copyright'), 'text', "")
-        assert _debug_wayland(f" > Initializing Protocol: '{self.name}'")
+        assert _debug_wayland(f"> {self}: initializing...")
 
         self._interface_classes = {}
 
@@ -456,8 +455,8 @@ class Protocol:
 
         oid = oid or self.client.get_next_oid()
         interface = self._interface_classes[name](oid=oid)
-        self.client.objects[oid] = interface
-        assert _debug_wayland(f"{self}: created {interface}")
+        self.client.client_objects[oid] = interface
+        assert _debug_wayland(f"> {self}: created {interface}")
         return interface
 
     def delete_interface(self, oid: int) -> None:
@@ -466,9 +465,9 @@ class Protocol:
         Args:
             oid: The object ID (oid) of the interface.
         """
-        interface = self.client.objects.pop(oid)
+        interface = self.client.client_objects.pop(oid)
         self.client.oid_pool.append(oid)   # to reuse later
-        assert _debug_wayland(f"{self}: deleted {interface}")
+        assert _debug_wayland(f"> {self}: deleted {interface}")
 
     @property
     def interface_names(self) -> list[str]:
@@ -477,6 +476,12 @@ class Protocol:
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}('{self.name}')"
 
+
+GlobalObject = _namedtuple('GlobalObject', 'name, interface, version')
+
+##################################
+#           User API
+##################################
 
 class Client:
     """Wayland Client
@@ -527,8 +532,10 @@ class Client:
         self._oid_generator = _itertools.cycle(range(1, 0xfeffffff))
         self.oid_pool = []
 
-        # A mapping of oids to interfaces:
-        self.objects = {}
+        self.client_objects = {}    # oid: Interface
+        self.global_objects = {}    # interface_name: GlobalObject
+        self.global_mapping = {}    # global_name: interface_name
+
         self.protocol_dict = dict()
         self.protocols = _ObjectSpace()
 
@@ -554,27 +561,49 @@ class Client:
         self.wl_display.set_handler('global_remove', self._wl_registry_global_remove)
         self.wl_display.get_registry(self.wl_registry.oid)
 
+        self._sync_semaphore = _threading.Semaphore()
+
+    def _wl_display_sync_handler(self, callback_data):
+        self._sync_semaphore.release()
+
+    def sync(self):
+        """Helper shortcut for wl_display.sync calls.
+
+        This method creates a throw-away ``wl_callback`` object, calls
+        ``wl_display.sync``, and then blocks until the ``wl_callback.done``
+        event is returned from the server.
+        """
+        wl_callback = self.protocol_dict['wayland'].create_interface(name='wl_callback')
+        wl_callback.set_handler('done', self._wl_display_sync_handler)
+        self.wl_display.sync(wl_callback.oid)
+        self._sync_semaphore.acquire(True, 240)
+
     def fileno(self) -> int:
         """The fileno of the internal socket.
 
-        This method exists to allow the class
-        to be "selectable" (see the ``select`` module).
+        This method allows the class to be "selectable" (see the ``select`` module).
         """
         return self._sock.fileno()
 
     def get_next_oid(self) -> int:
-        """Get the next available or recycled object ID (oid)."""
+        """Get the next available (or recycled) object ID.
+
+        This method is called automatically by the :py:meth:~`Protocol.create_interface`
+        method, and it is not necessary to call this by yourself. Only use this method
+        if you are manually creating and binding Interfaces. Otherwise, do not call it.
+        """
         if self.oid_pool:
             return self.oid_pool.pop()
 
         oid = next(self._oid_generator)
 
-        while oid in self.objects:
+        while oid in self.client_objects:
             oid = next(self._oid_generator)
 
         return oid
 
     def send(self, request: bytes, fds: bytes) -> None:
+        """Send messages to the server."""
         self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
 
     def receive(self) -> None:
@@ -602,7 +631,7 @@ class Client:
             # - find the matching object (interface) from the header.oid
             # - find the matching event by its header.opcode
             # - pass the raw payload into the event, which will decode it
-            interface = self.objects[header.oid]
+            interface = self.client_objects[header.oid]
             event = interface.events[header.opcode]
             event(data[_header_len:header.size])
 
@@ -635,8 +664,14 @@ class Client:
         # TODO: map this to the right interface/enum/entry
         print("ERROR callback: ", oid, code, message)
 
-    def _wl_registry_global(self, *args):
-        print("registry global callback: ", *args)
+    def _wl_registry_global(self, name, interface, version):
+        assert _debug_wayland(f"wl_registry global: {name}, {interface}, {version}")
+        self.global_objects[interface] = GlobalObject(name, interface, version)
+        self.global_mapping[name] = interface
 
-    def _wl_registry_global_remove(self, *args):
-        print("registry global_remove callback: ", *args)
+    def _wl_registry_global_remove(self, name):
+        assert _debug_wayland(f"wl_registry global remove: {name}")
+        interface_name = self.global_mapping[name]
+        del self.global_mapping[name]
+        del self.global_objects[interface_name]
+        # TODO: anything to do for created objects?
