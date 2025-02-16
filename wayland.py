@@ -17,9 +17,11 @@ from xml.etree.ElementTree import Element
 
 __version__ = 0.6
 
+debug = True
 
 def _debug_wayland(message: str) -> bool:
-    print(f"wl:  {message}")
+    if debug:
+        print(f"wl:  {message}")
     return True
 
 
@@ -52,8 +54,20 @@ class EventDispatcher:
 #          Exceptions
 ##################################
 
-class WaylandServerError(OSError):
-    ...
+class WaylandException(BaseException):
+    """Base Wayland Exception"""
+
+
+class WaylandServerError(WaylandException):
+    """A logical error from the Server."""
+
+
+class WaylandSocketError(WaylandException, OSError):
+    """Errors related to Socket IO."""
+
+
+class WaylandProtocolError(WaylandException, NameError):
+    """A Protocol related error."""
 
 
 ##################################
@@ -321,7 +335,7 @@ class Request:
 
     def _send(self, bytestring, *fds):
         size = Header.length + len(bytestring)
-        header = Header(oid=self.oid, opcode=self.opcode, size=size)
+        header = Header(self.oid, self.opcode, size)
         request = header.to_bytes() + bytestring
         fds = b''.join(fd.to_bytes() for fd in fds)
         self._client.send(request, fds)
@@ -451,7 +465,7 @@ class Protocol:
         Returns: an Interface instance.
         """
         if name not in self._interface_classes:
-            raise NameError(f"The '{self.name}' Protocol does not define an interface named '{name}'")
+            raise WaylandProtocolError(f"The '{self.name}' Protocol does not define an interface named '{name}'")
 
         oid = oid or self.client.get_next_oid()
         interface = self._interface_classes[name](oid=oid)
@@ -503,7 +517,8 @@ class Client:
     def __init__(self, *protocols: str) -> None:
         """Create a Wayland Client connection.
 
-        :param protocols: one or more protocol xml file paths.
+        Args:
+            *protocols: The file path to one or more <protocol>.xml files.
         """
         assert protocols, ("At a minimum you must provide at least a wayland.xml "
                            "protocol file, commonly '/usr/share/wayland/wayland.xml'.")
@@ -519,7 +534,7 @@ class Client:
         assert _debug_wayland(f"endpoint: {path}")
 
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Wayland endpoint not found: {path}")
+            raise WaylandSocketError(f"Wayland endpoint not found: {path}")
 
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
         self._sock.setblocking(False)
@@ -528,7 +543,7 @@ class Client:
 
         assert _debug_wayland(f"connected to: {self._sock.getpeername()}")
 
-        # Client side object ID generator:
+        # Client side object ID generation:
         self._oid_generator = _itertools.cycle(range(1, 0xfeffffff))
         self.oid_pool = []
 
@@ -541,7 +556,7 @@ class Client:
 
         for filename in protocols:
             if not os.path.exists(filename):
-                raise FileNotFoundError(f"Protocol file was not found: {filename}")
+                raise WaylandSocketError(f"Protocol file was not found: {filename}")
 
             protocol = Protocol(client=self, filename=filename)
             self.protocol_dict[protocol.name] = protocol
@@ -562,9 +577,6 @@ class Client:
         self.wl_display.get_registry(self.wl_registry.oid)
 
         self._sync_semaphore = _threading.Semaphore()
-
-    def _wl_display_sync_handler(self, callback_data):
-        self._sync_semaphore.release()
 
     def sync(self):
         """Helper shortcut for wl_display.sync calls.
@@ -614,6 +626,11 @@ class Client:
             new_data, ancdata, msg_flags, _ = self._sock.recvmsg(4096, socket.CMSG_SPACE(64))
         except BlockingIOError:
             return
+        except ConnectionError:
+            raise WaylandSocketError(f"Socket is closed")
+
+        if new_data == b"":
+            raise WaylandSocketError(f"Socket is dead")
 
         # Include any leftover partial data:
         data = self._recv_buffer + new_data
@@ -663,6 +680,9 @@ class Client:
     def _wl_display_error_handler(self, oid: int, code: int, message: str):
         # TODO: map this to the right interface/enum/entry
         print("ERROR callback: ", oid, code, message)
+
+    def _wl_display_sync_handler(self, _unused):
+        self._sync_semaphore.release()
 
     def _wl_registry_global(self, name, interface, version):
         assert _debug_wayland(f"wl_registry global: {name}, {interface}, {version}")
