@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import abc
 import socket
-import struct
 import itertools as _itertools
 import threading as _threading
 
+from struct import Struct
 from collections import namedtuple as _namedtuple
 
 from types import FunctionType
@@ -75,8 +75,9 @@ class WaylandProtocolError(WaylandException, NameError):
 ##################################
 
 class WaylandType(abc.ABC):
-    length: int
+    struct: Struct
     value: int | float | str | bytes
+    length: int
 
     @abc.abstractmethod
     def to_bytes(self) -> bytes:
@@ -92,49 +93,54 @@ class WaylandType(abc.ABC):
 
 
 class Int(WaylandType):
-    length = struct.calcsize('i')
+    struct = Struct('i')
+    length = struct.size
 
     def __init__(self, value: int):
         self.value = value
 
     def to_bytes(self) -> bytes:
-        return struct.pack('i', self.value)
+        return self.struct.pack(self.value)
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> Int:
-        return cls(struct.unpack('i', buffer[:cls.length])[0])
+        return cls(cls.struct.unpack(buffer[:cls.length])[0])
 
 
 class UInt(WaylandType):
-    length = struct.calcsize('I')
+    struct = Struct('I')
+    length = struct.size
 
     def __init__(self, value: int):
         self.value = value
 
     def to_bytes(self) -> bytes:
-        return struct.pack('I', self.value)
+        return self.struct.pack(self.value)
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> UInt:
-        return cls(struct.unpack('I', buffer[:cls.length])[0])
+        return cls(cls.struct.unpack(buffer[:cls.length])[0])
 
 
 class Fixed(WaylandType):
-    length = struct.calcsize('I')
+    struct = Struct('I')
+    length = struct.size
 
     def __init__(self, value: int):
         self.value = value
 
     def to_bytes(self) -> bytes:
-        return struct.pack('I', (int(self.value) << 8) + int((self.value % 1.0) * 256))
+        return self.struct.pack((int(self.value) << 8) + int((self.value % 1.0) * 256))
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> Fixed:
-        unpacked = struct.unpack('I', buffer[:cls.length])[0]
+        unpacked = cls.struct.unpack(buffer[:cls.length])[0]
         return cls((unpacked >> 8) + (unpacked & 0xff) / 256.0)
 
 
 class String(WaylandType):
+    struct = Struct('I')
+
     def __init__(self, text: str):
         # length uint + text length + 4byte padding
         self.length = 4 + len(text) + (-len(text) % 4)
@@ -144,16 +150,18 @@ class String(WaylandType):
         length = len(self.value) + 1
         padding = (4 - (length % 4))
         encoded = self.value.encode() + b'\x00'
-        return struct.pack('I', length) + encoded.ljust(padding, b'\x00')
+        return self.struct.pack(length) + encoded.ljust(padding, b'\x00')
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> String:
-        length = struct.unpack('I', buffer[:4])[0]      # 32-bit integer
+        length = cls.struct.unpack(buffer[:4])[0]      # 32-bit integer
         text = buffer[4:4+length-1].decode()
         return cls(text)
 
 
 class Array(WaylandType):
+    struct = Struct('I')
+
     def __init__(self, array: bytes):
         # length uint + text length + 4byte padding
         self.length = 4 + len(array) + (-len(array) % 4)
@@ -162,30 +170,31 @@ class Array(WaylandType):
     def to_bytes(self) -> bytes:
         length = len(self.value)
         padding_size = (4 - (length % 4))
-        return struct.pack('I', length) + b'\x00' * padding_size
+        return self.struct.pack(length) + b'\x00' * padding_size
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> Array:
-        length = struct.unpack('I', buffer[:4])[0]      # 32-bit integer
+        length = cls.struct.unpack(buffer[:4])[0]      # 32-bit integer
         array = buffer[4:4+length]
         return cls(array)
 
 
 class Header(WaylandType):
-    length = struct.calcsize('IHH')
+    struct = Struct('IHH')
+    length = struct.size
 
     def __init__(self, oid, opcode, size):
         self.oid = oid
         self.opcode = opcode
         self.size = size
-        self.value = struct.pack('IHH', oid, opcode, size)
+        self.value = self.struct.pack(oid, opcode, size)
 
     def to_bytes(self) -> bytes:
         return self.value
 
     @classmethod
     def from_bytes(cls, buffer) -> Header:
-        return cls(*struct.unpack('IHH', buffer))
+        return cls(*cls.struct.unpack(buffer))
 
     def __repr__(self):
         return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode}, size={self.size})"
