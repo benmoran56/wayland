@@ -148,7 +148,7 @@ class String(WaylandType):
 
     def to_bytes(self) -> bytes:
         length = len(self.value) + 1
-        padding = (4 - (length % 4))
+        padding = (4 - (length % 4))    # TODO: fix padding
         encoded = self.value.encode() + b'\x00'
         return self.struct.pack(length) + encoded.ljust(padding, b'\x00')
 
@@ -205,7 +205,12 @@ class Object(UInt):
 
 
 class NewID(UInt):
-    pass
+
+    def to_bytes(self) -> bytes:
+        # Special case for wl_registry.bind()
+        if isinstance(self.value, bytes):
+            return self.value
+        return super().to_bytes()
 
 
 class FD(Int):
@@ -597,7 +602,7 @@ class Client:
         wl_callback = self.protocol_dict['wayland'].create_interface(name='wl_callback')
         wl_callback.set_handler('done', self._wl_display_sync_handler)
         self.wl_display.sync(wl_callback.oid)
-        self._sync_semaphore.acquire(True, 240)
+        self._sync_semaphore.acquire(True, 5)
 
     def fileno(self) -> int:
         """The fileno of the internal socket.
