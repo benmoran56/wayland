@@ -142,15 +142,14 @@ class String(WaylandType):
     struct = Struct('I')
 
     def __init__(self, text: str):
-        # length uint + text length + 4byte padding
+        # length uint + text length + 4byte rounding
         self.length = 4 + len(text) + (-len(text) % 4)
         self.value = text
 
     def to_bytes(self) -> bytes:
-        length = len(self.value) + 1
-        padding = (4 - (length % 4))    # TODO: fix padding
-        encoded = self.value.encode() + b'\x00'
-        return self.struct.pack(length) + encoded.ljust(padding, b'\x00')
+        padding = self.length - self.struct.size
+        encoded = self.value.encode()
+        return self.struct.pack(self.length) + encoded.ljust(padding, b'\x00')
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> String:
