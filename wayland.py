@@ -9,8 +9,6 @@ import threading as _threading
 from struct import Struct
 from collections import namedtuple as _namedtuple
 
-from types import FunctionType
-
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
@@ -239,13 +237,16 @@ class _ObjectSpace:
 
 class Argument:
 
-    def __init__(self, parent, element):
-        self._parent = parent
+    def __init__(self, request, element):
+        self._request = request
         self._element = element
         self.name = element.get('name')
-        self.summary = element.get('summary')
         self.type_name = element.get('type')
         self.wl_type = _type_map[self.type_name]
+        self.summary = element.get('summary')
+
+        self.interface = element.get('interface')
+        self.returns_new_object = self.wl_type is NewID and self.interface
 
     def __call__(self, value) -> bytes:
         return self.wl_type(value).to_bytes()
@@ -307,38 +308,12 @@ class Event:
         return f"{self.__class__.__name__}(name={self.name}, opcode={self.opcode}, args=({args}))"
 
 
-class RequestBase:
-    """Request base class"""
-
-    arguments: list
-
-    def __init__(self, interface, element, opcode):
-        self._interface = interface
-        self._client = interface.protocol.client
-        self.oid = self._interface.oid
-        self.opcode = opcode
-
-        self.name = element.get('name')
-        self.description = getattr(element.find('description'), 'text', "")
-        self.summary = element.find('description').get('summary') if self.description else ""
-
-    def _send(self, bytestring, *fds):
-        size = Header.length + len(bytestring)
-        header = Header(oid=self.oid, opcode=self.opcode, size=size)
-        request = header.to_bytes() + bytestring
-        fds = b''.join(fd.to_bytes() for fd in fds)
-        self._client.send(request, fds)
-
-    def __repr__(self):
-        return f"{self.name}(opcode={self.opcode}, args=({', '.join((f'{a}' for a in self.arguments))}))"
-
-
 class Request:
 
     def __init__(self, interface, element, opcode):
-        self._interface = interface
+        self._protocol = interface.protocol
         self._client = interface.protocol.client
-        self.oid = self._interface.oid
+        self.parent_oid = interface.oid
         self.opcode = opcode
 
         self.name = element.get('name')
@@ -347,15 +322,31 @@ class Request:
 
         self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
 
+        # TODO: attempt to update a custom signature/annotations for the __call__ method.
+
     def _send(self, bytestring, *fds):
+        """Attach a Header to the payload, and send."""
         size = Header.length + len(bytestring)
-        header = Header(self.oid, self.opcode, size)
+        header = Header(self.parent_oid, self.opcode, size)
+        # final request and file descriptor payloads:
         request = header.to_bytes() + bytestring
-        fds = b''.join(fd.to_bytes() for fd in fds)
+        fds = b''.join(Int(fd).to_bytes() for fd in fds)
         self._client.send(request, fds)
 
-    def __call__(self, *args) -> bytes:
-        return b''.join(self.arguments[i](value) for i, value in enumerate(args))
+    def __call__(self, *args, fds=tuple()):
+        assert len(args) == len(self.arguments), f"Valid arguments: {self.arguments}"
+        bytestring = b''
+        interface = None
+
+        for argument, value in zip(self.arguments, args):
+            bytestring += argument(value)
+
+            if argument.returns_new_object:
+                interface = self._protocol.create_interface(argument.interface, value)
+
+
+        self._send(bytestring, *fds)
+        return interface
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=[{', '.join((f'{a}' for a in self.arguments))}])"
@@ -380,58 +371,9 @@ class InterfaceBase(EventDispatcher):
         self.events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
         self.event_types = [event.name for event in self.events]
 
-        # TODO: figure out these requests
-        # self.requests = [Request(self, element, opc) for opc, element in enumerate(self._element.findall('request'))]
-        self.requests = list(self._create_requests())
+        self.requests = [Request(self, elem, opcode) for opcode, elem in enumerate(self._element.findall('request'))]
         for request in self.requests:
             setattr(self, request.name, request)
-
-    def _create_requests(self):
-        """Dynamically create `request` methods
-
-        This method parses the xml element for `request` definitions,
-        and dynamically creates callable Request classes from them. These
-        Request instances are then assigned by name to the Interface,
-        allowing them to be called like a normal Python methods.
-        """
-        for i, element in enumerate(self._element.findall('request')):
-            request_name = element.get('name')
-
-            # Arguments are callable objects that type cast and return bytes:
-            arguments = [Argument(self, arg) for arg in element.findall('arg')]
-
-            # Create a dynamic __call__ method with correct signature:
-            arg_names = [f"{arg.name}_{arg.type_name}" for arg in arguments]
-            signature = "self, " + ", ".join(arg_names)
-            call_string = " + ".join(f"arguments[{i}]({arg_name})" for i, arg_name in enumerate(arg_names))
-            source = f"def {request_name}({signature}):\n    self._send({call_string})"
-            ########## Final source code should look something like: ##############
-            #
-            #   def request_name(self, argument1, argument2):
-            #       self._send(arguments[0](argument1) + arguments[1](argument2))
-            #
-            #######################################################################
-
-            # Compile the source code into a function:
-            compiled_code = compile(source=source, filename="<string>", mode="exec")
-            method = FunctionType(compiled_code.co_consts[0], locals(), request_name)
-
-            # Create a dynamic Request class which includes the custom __call__ method:
-            request_class = type(request_name, (RequestBase,), {'__call__': method, 'arguments': arguments})
-
-            yield request_class(interface=self, element=element, opcode=i)
-
-            # def _call(self, *args) -> bytes:
-            #     return b''.join(self.arguments[_i](value) for _i, value in enumerate(args))
-            #
-            # # request = Request(interface=self, element=element, opcode=i, arguments=arguments)
-            # request_class = type(request_name, (Request,), {'__call__': _call})
-            #
-            # sig = signature(_call)
-            # parameters = [Parameter(name=arg.name, kind=Parameter.VAR_POSITIONAL) for arg in arguments]
-            # _call.__signature__ = sig.replace(parameters=parameters)
-            #
-            # yield request_class(interface=self, element=element, opcode=i)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode})"
@@ -469,6 +411,27 @@ class Protocol:
             self._interface_classes[name] = interface_class
             assert _debug_wayland(f"   * found interface: '{name}'")
 
+    def bind_interface(self, name):
+        """Create an Interface instance & bind to a global object.
+
+        Args:
+            name: The Interface name.
+
+        Returns: an Interface instance.
+        """
+        # find global match:
+        interface_global = self.client.global_objects[name]
+        # make client-side object:
+        interface_instance = self.create_interface(name)
+        _string = String(name).to_bytes()
+        _version = UInt(interface_global.version).to_bytes()
+        _new_id = NewID(interface_instance.oid).to_bytes()
+        combined_new_id = _string + _version + _new_id
+
+        assert _debug_wayland(f"> {self}.bind: global {name}")
+        self.client.wl_registry.bind(interface_global.name, combined_new_id)
+        return interface_instance
+
     def create_interface(self, name: str, oid: int | None = None):
         """Create an Interface instance by name.
 
@@ -483,8 +446,8 @@ class Protocol:
 
         oid = oid or self.client.get_next_oid()
         interface = self._interface_classes[name](oid=oid)
+        assert _debug_wayland(f"> {self}.create_interface: {interface}")
         self.client.client_objects[oid] = interface
-        assert _debug_wayland(f"> {self}: created {interface}")
         return interface
 
     def delete_interface(self, oid: int) -> None:
@@ -495,7 +458,7 @@ class Protocol:
         """
         interface = self.client.client_objects.pop(oid)
         self.client.oid_pool.append(oid)   # to reuse later
-        assert _debug_wayland(f"> {self}: deleted {interface}")
+        assert _debug_wayland(f"> {self}delete_interface: {interface}")
 
     @property
     def interface_names(self) -> list[str]:
@@ -585,10 +548,9 @@ class Client:
         self.wl_display.set_handler('delete_id', self._wl_display_delete_id_handler)
 
         # Create global registry:
-        self.wl_registry = self.protocol_dict['wayland'].create_interface(name='wl_registry')
+        self.wl_registry = self.wl_display.get_registry(self.get_next_oid())
         self.wl_display.set_handler('global', self._wl_registry_global)
         self.wl_display.set_handler('global_remove', self._wl_registry_global_remove)
-        self.wl_display.get_registry(self.wl_registry.oid)
 
         self._sync_semaphore = _threading.Semaphore()
 
@@ -599,9 +561,8 @@ class Client:
         ``wl_display.sync``, and then blocks until the ``wl_callback.done``
         event is returned from the server.
         """
-        wl_callback = self.protocol_dict['wayland'].create_interface(name='wl_callback')
+        wl_callback = self.wl_display.sync(self.get_next_oid())
         wl_callback.set_handler('done', self._wl_display_sync_handler)
-        self.wl_display.sync(wl_callback.oid)
         self._sync_semaphore.acquire(True, 5)
 
     def fileno(self) -> int:
