@@ -27,29 +27,6 @@ def _debug_wayland(message: str) -> bool:
 assert _debug_wayland(f"version: {__version__}")
 
 ##################################
-#       Event Dispatching
-##################################
-
-class EventDispatcher:
-
-    _handlers = {}
-    event_types = []
-
-    def dispatch_event(self, name, *args):
-        for handler in self._handlers.get(name, []):
-            handler(*args)
-
-    def set_handler(self, name, handler):
-        handlers = self._handlers.get(name, [])
-        handlers.append(handler)
-        self._handlers[name] = handlers
-
-    def remove_handler(self, name, handler):
-        if handlers := self._handlers.get(name):
-            if handler in handlers:
-                handlers.remove(handler)
-
-##################################
 #          Exceptions
 ##################################
 
@@ -75,8 +52,8 @@ class WaylandProtocolError(WaylandException, NameError):
 
 class WaylandType(abc.ABC):
     struct: Struct
-    value: int | float | str | bytes
     length: int
+    value: int | float | str | bytes
 
     @abc.abstractmethod
     def to_bytes(self) -> bytes:
@@ -328,38 +305,43 @@ class Request:
         self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
         # TODO: attempt to update a custom signature/annotations for the __call__ method.
 
-    def _send(self, bytestring, *fds) -> None:
+    def _send(self, bytestring, fds) -> None:
         """Attach a Header to the payload, and send."""
         size = Header.length + len(bytestring)
         header = Header(self.parent_oid, self.opcode, size)
         # final request and file descriptor payloads:
         request = header.to_bytes() + bytestring
-        fds = b''.join(Int(fd).to_bytes() for fd in fds)
         self._client.send(request, fds)
 
-    def __call__(self, *args: Any, fds: Iterable[int] = tuple()) -> None | Interface:
+    def __call__(self, *args: Any) -> None | Interface:
         assert len(args) == len(self.arguments), f"Valid arguments: {self.arguments}"
         bytestring = b''
+        fds = b''
         interface = None
 
         for argument, value in zip(self.arguments, args):
-            bytestring += argument(value)
             if argument.returns_new_object:
                 interface = self._protocol.create_interface(argument.interface, value)
+            if argument.wl_type is FD:
+                fds += argument(value)
+                continue
+            bytestring += argument(value)
 
-        self._send(bytestring, *fds)
+        self._send(bytestring, fds)
         return interface
 
     def __repr__(self):
         return f"{self.name}(opcode={self.opcode}, args=({', '.join((f'{a}' for a in self.arguments))}))"
 
 
-class Interface(EventDispatcher):
+class Interface:
     """Interface base class"""
 
     _element: Element
     protocol: Protocol
     opcode: int
+
+    _handlers: dict
 
     def __init__(self, oid: int):
         self.oid = oid
@@ -376,6 +358,21 @@ class Interface(EventDispatcher):
         self.requests = [Request(self, elem, opcode) for opcode, elem in enumerate(self._element.findall('request'))]
         for request in self.requests:
             setattr(self, request.name, request)
+
+        self._handlers = dict()
+        for name in self.event_types:
+            self._handlers[name] = []
+
+    def dispatch_event(self, name, *args):
+        for handler in self._handlers[name]:
+            handler(*args)
+
+    def set_handler(self, name, handler):
+        self._handlers[name].append(handler)
+
+    def remove_handler(self, name, handler):
+        if handler in self._handlers[name]:
+            self._handlers[name].remove(handler)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode})"
@@ -543,8 +540,8 @@ class Client:
 
         # Create global registry:
         self.wl_registry = self.wl_display.get_registry(self.get_next_oid())
-        self.wl_display.set_handler('global', self._wl_registry_global)
-        self.wl_display.set_handler('global_remove', self._wl_registry_global_remove)
+        self.wl_registry.set_handler('global', self._wl_registry_global)
+        self.wl_registry.set_handler('global_remove', self._wl_registry_global_remove)
 
         self._sync_semaphore = _threading.Semaphore()
 
