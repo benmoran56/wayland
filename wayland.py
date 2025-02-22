@@ -7,16 +7,17 @@ import itertools as _itertools
 import threading as _threading
 
 from struct import Struct
+from collections import deque as _deque
 from collections import namedtuple as _namedtuple
 
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element
 
-from typing import Any, Iterable
+from typing import Any
 
 __version__ = 0.6
 
-debug = True
+debug = False
 
 def _debug_wayland(message: str) -> bool:
     if debug:
@@ -25,6 +26,29 @@ def _debug_wayland(message: str) -> bool:
 
 
 assert _debug_wayland(f"version: {__version__}")
+
+
+
+class ObjectIDPool:
+
+    def __init__(self, minimum: int, maximum: int):
+        self._sequence = _itertools.cycle(range(minimum, maximum))
+        self._recycle_pool = _deque()
+
+    def __next__(self):
+        if self._recycle_pool:
+            return self._recycle_pool.popleft()
+
+        oid = next(self._sequence)
+
+        while oid in self._recycle_pool:
+            oid = next(self._sequence)
+
+        return oid
+
+    def send(self, oid):
+        self._recycle_pool.append(oid)
+
 
 ##################################
 #          Exceptions
@@ -435,7 +459,7 @@ class Protocol:
         if name not in self._interface_classes:
             raise WaylandProtocolError(f"The '{self.name}' Protocol does not define an interface named '{name}'")
 
-        oid = oid or self.client.get_next_oid()
+        oid = oid or next(self.client.oid_pool)
         interface = self._interface_classes[name](oid=oid)
         assert _debug_wayland(f"> {self}.create_interface: {interface}")
         self.client.client_objects[oid] = interface
@@ -448,7 +472,7 @@ class Protocol:
             oid: The object ID (oid) of the interface.
         """
         interface = self.client.client_objects.pop(oid)
-        self.client.oid_pool.append(oid)   # to reuse later
+        self.client.oid_pool.send(oid)      # to reuse later
         assert _debug_wayland(f"> {self}delete_interface: {interface}")
 
     @property
@@ -512,8 +536,7 @@ class Client:
         assert _debug_wayland(f"connected to: {self._sock.getpeername()}")
 
         # Client side object ID generation:
-        self._oid_generator = _itertools.cycle(range(1, 0xfeffffff))
-        self.oid_pool = []
+        self.oid_pool = ObjectIDPool(minimum=1, maximum=0xfeffffff)
 
         self.client_objects = {}    # oid: Interface
         self.global_objects = {}    # interface_name: GlobalObject
@@ -539,7 +562,7 @@ class Client:
         self.wl_display.set_handler('delete_id', self._wl_display_delete_id_handler)
 
         # Create global registry:
-        self.wl_registry = self.wl_display.get_registry(self.get_next_oid())
+        self.wl_registry = self.wl_display.get_registry(next(self.oid_pool))
         self.wl_registry.set_handler('global', self._wl_registry_global)
         self.wl_registry.set_handler('global_remove', self._wl_registry_global_remove)
 
@@ -562,23 +585,6 @@ class Client:
         This method allows the class to be "selectable" (see the ``select`` module).
         """
         return self._sock.fileno()
-
-    def get_next_oid(self) -> int:
-        """Get the next available (or recycled) object ID.
-
-        This method is called automatically by the :py:meth:~`Protocol.create_interface`
-        method, and it is not necessary to call this by yourself. Only use this method
-        if you are manually creating and binding Interfaces. Otherwise, do not call it.
-        """
-        if self.oid_pool:
-            return self.oid_pool.pop()
-
-        oid = next(self._oid_generator)
-
-        while oid in self.client_objects:
-            oid = next(self._oid_generator)
-
-        return oid
 
     def send(self, request: bytes, fds: bytes) -> None:
         """Send messages to the server."""
