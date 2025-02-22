@@ -575,7 +575,7 @@ class Client:
         ``wl_display.sync``, and then blocks until the ``wl_callback.done``
         event is returned from the server.
         """
-        wl_callback = self.wl_display.sync(self.get_next_oid())
+        wl_callback = self.wl_display.sync(next(self.oid_pool))
         wl_callback.set_handler('done', self._wl_display_sync_handler)
         self._sync_semaphore.acquire(True, 5)
 
@@ -662,7 +662,7 @@ class Client:
         self.global_mapping[name] = interface
 
     def _wl_registry_global_remove(self, name):
-        assert _debug_wayland(f"wl_registry global remove: {name}")
+        assert _debug_wayland(f"wl_registry global_remove: {name}")
         interface_name = self.global_mapping[name]
         del self.global_mapping[name]
         del self.global_objects[interface_name]
