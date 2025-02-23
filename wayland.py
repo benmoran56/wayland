@@ -7,11 +7,12 @@ import itertools as _itertools
 import threading as _threading
 
 from struct import Struct
+from types import SimpleNamespace as _NameSpace
 from collections import deque as _deque
 from collections import namedtuple as _namedtuple
 
 from xml.etree import ElementTree
-from xml.etree.ElementTree import Element
+from xml.etree.ElementTree import Element, ParseError
 
 from typing import Any
 
@@ -66,7 +67,7 @@ class WaylandSocketError(WaylandException, OSError):
     """Errors related to Socket IO."""
 
 
-class WaylandProtocolError(WaylandException, NameError):
+class WaylandProtocolError(WaylandException, FileNotFoundError):
     """A Protocol related error."""
 
 
@@ -220,18 +221,6 @@ class FD(Int):
     pass
 
 
-_type_map = {
-    'int':      Int,
-    'uint':     UInt,
-    'fixed':    Fixed,
-    'string':   String,
-    'object':   Object,
-    'new_id':   NewID,
-    'array':    Array,
-    'fd':       FD,
-}
-
-
 class _ObjectSpace:
     pass
 
@@ -242,12 +231,23 @@ class _ObjectSpace:
 
 class Argument:
 
+    _type_map = {
+        'int': Int,
+        'uint': UInt,
+        'fixed': Fixed,
+        'string': String,
+        'object': Object,
+        'new_id': NewID,
+        'array': Array,
+        'fd': FD,
+    }
+
     def __init__(self, request, element):
         self._request = request
         self._element = element
         self.name = element.get('name')
         self.type_name = element.get('type')
-        self.wl_type = _type_map[self.type_name]
+        self.wl_type = self._type_map[self.type_name]
         self.summary = element.get('summary')
         self.allow_null = True if element.get('allow-null') else False
 
@@ -335,13 +335,13 @@ class Request:
         header = Header(self.parent_oid, self.opcode, size)
         # final request and file descriptor payloads:
         request = header.to_bytes() + bytestring
-        self._client.send(request, fds)
+        self._client.sendmsg(request, fds)
 
     def __call__(self, *args: Any) -> None | Interface:
-        assert len(args) == len(self.arguments), f"Valid arguments: {self.arguments}"
+        assert len(args) == len(self.arguments), f"expected {len(self.arguments)} arguments: {self.arguments}"
+        interface = None
         bytestring = b''
         fds = b''
-        interface = None
 
         for argument, value in zip(self.arguments, args):
             if argument.returns_new_object:
@@ -416,10 +416,12 @@ class Protocol:
             client: The parent Client to which this Protocol belongs.
             filename: The .xml file that contains the Protocol definition.
         """
+        try:
+            self._root = ElementTree.parse(filename).getroot()
+        except (FileNotFoundError, ParseError)as e:
+            raise WaylandProtocolError(e)
 
         self.client = client
-        self._root = ElementTree.parse(filename).getroot()
-
         self.name = self._root.get('name')
         self.copyright = getattr(self._root.find('copyright'), 'text', "")
         assert _debug_wayland(f"> {self}: initializing...")
@@ -542,22 +544,13 @@ class Client:
         self.global_objects = {}    # interface_name: GlobalObject
         self.global_mapping = {}    # global_name: interface_name
 
-        self.protocol_dict = dict()
-        self.protocols = _ObjectSpace()
-
-        for filename in protocols:
-            if not os.path.exists(filename):
-                raise WaylandSocketError(f"Protocol file was not found: {filename}")
-
-            protocol = Protocol(client=self, filename=filename)
-            self.protocol_dict[protocol.name] = protocol
-            # Temporary addition for easy access in the REPL:
-            setattr(self.protocols, protocol.name, protocol)
+        self.protocol_dict = {p.name: p for p in [Protocol(self, filename) for filename in protocols]}
+        self.protocols = _NameSpace(self.protocol_dict)
 
         assert 'wayland' in self.protocol_dict, "You must provide at minimum a wayland.xml protocol file."
 
         # Create global display interface:
-        self.wl_display = self.protocol_dict['wayland'].create_interface(name='wl_display')
+        self.wl_display = self.protocols.wayland.create_interface(name='wl_display')
         self.wl_display.set_handler('error', self._wl_display_error_handler)
         self.wl_display.set_handler('delete_id', self._wl_display_delete_id_handler)
 
@@ -586,8 +579,7 @@ class Client:
         """
         return self._sock.fileno()
 
-    def send(self, request: bytes, fds: bytes) -> None:
-        """Send messages to the server."""
+    def sendmsg(self, request: bytes, fds: bytes) -> None:
         self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
 
     def receive(self) -> None:
@@ -647,7 +639,7 @@ class Client:
     # Event handlers
 
     def _wl_display_delete_id_handler(self, oid):
-        self.protocol_dict['wayland'].delete_interface(oid)
+        self.protocols.wayland.delete_interface(oid)
 
     def _wl_display_error_handler(self, oid: int, code: int, message: str):
         # TODO: map this to the right interface/enum/entry
