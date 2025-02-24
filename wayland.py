@@ -498,21 +498,21 @@ class Client:
     As per the Wayland specification, the `WAYLAND_DISPLAY` environmental
     variable is queried for the endpoint name. If this is an absolute path,
     it is used as-is. If not, the final socket path will be made by joining
-    the `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY` environmental variables.
+    the ``XDG_RUNTIME_DIR`` + ``WAYLAND_DISPLAY`` environmental variables.
 
     To create an instance of this class, at least one Wayland Protocol file
     must be provided. Protocol files are XML, and are generally found under
-    the `/usr/share/wayland/` directory. At a minimum, the base Wayland
-    protocol file (`wayland.xml`) is required.
+    the ``/usr/share/wayland*`` directories. At a minimum, the base Wayland
+    protocol file (``wayland.xml``) is required.
 
     When instantiated, the Client automatically creates the main Display
-    (`wl_display`) interface, which is available as `Client.wl_display`.
+    (``wl_display``) interface, which is available as ``Client.wl_display``.
     """
     def __init__(self, *protocols: str) -> None:
         """Create a Wayland Client connection.
 
         Args:
-            *protocols: The file path to one or more <protocol>.xml files.
+            *protocols: The file path(s) to one or more <protocol>.xml files.
         """
         assert protocols, ("At a minimum you must provide at least a wayland.xml "
                            "protocol file, commonly '/usr/share/wayland/wayland.xml'.")
@@ -559,18 +559,20 @@ class Client:
         self.wl_registry.set_handler('global', self._wl_registry_global)
         self.wl_registry.set_handler('global_remove', self._wl_registry_global_remove)
 
-        self._sync_semaphore = _threading.Semaphore()
+        self._sync_done = _threading.Event()
 
     def sync(self):
         """Helper shortcut for wl_display.sync calls.
 
-        This method creates a throw-away ``wl_callback`` object, calls
-        ``wl_display.sync``, and then blocks until the ``wl_callback.done``
+        This method calls ``wl_display.sync``, and obtains a new ``wl_callback`` object.
+        It then continuously calls :py:meth:~`Client.receive` until the ``wl_callback.done``
         event is returned from the server.
         """
         wl_callback = self.wl_display.sync(next(self.oid_pool))
         wl_callback.set_handler('done', self._wl_display_sync_handler)
-        self._sync_semaphore.acquire(True, 5)
+        while not self._sync_done.is_set():
+            self.receive()
+        self._sync_done.clear()
 
     def fileno(self) -> int:
         """The fileno of the internal socket.
@@ -580,10 +582,22 @@ class Client:
         return self._sock.fileno()
 
     def sendmsg(self, request: bytes, fds: bytes) -> None:
+        """Send prepared requests and (optional) file descriptors to the server.
+
+        This method expects the data to be pre-packed into bytestrings. This usually
+        means preparing the appropriate Header and payload (WaylandTypes), and using
+        their ``to_bytes`` methods to pack them into their raw byte representations.
+        If a request is also passing file descriptors, they should be separately packed
+        into the ``fds`` bytestring as file descriptors are sent as ancillary data.
+
+        Args:
+            request: a raw bytestring representing a concatenated Header & Request.
+            fds: a raw bytestring representing file descriptors.
+        """
         self._sock.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
 
     def receive(self) -> None:
-        """Receive Events from the server."""
+        """Receive and process Wayland Events from the server."""
         _header_len = Header.length
 
         try:
@@ -612,6 +626,7 @@ class Client:
             # - find the matching object (interface) from the header.oid
             # - find the matching event by its header.opcode
             # - pass the raw payload into the event, which will decode it
+            # TODO: handle "dead" interfaces:
             interface = self.client_objects[header.oid]
             event = interface.events[header.opcode]
             event(data[_header_len:header.size])
@@ -646,7 +661,7 @@ class Client:
         print("ERROR callback: ", oid, code, message)
 
     def _wl_display_sync_handler(self, _unused):
-        self._sync_semaphore.release()
+        self._sync_done.set()
 
     def _wl_registry_global(self, name, interface, version):
         assert _debug_wayland(f"wl_registry global: {name}, {interface}, {version}")
@@ -658,4 +673,4 @@ class Client:
         interface_name = self.global_mapping[name]
         del self.global_mapping[name]
         del self.global_objects[interface_name]
-        # TODO: anything to do for created objects?
+        # TODO: anything to do for previously created interfaces?
