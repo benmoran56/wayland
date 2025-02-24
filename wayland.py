@@ -280,6 +280,9 @@ class Enum:
         self.entries = [Entry(e.get('name'), e.get('value'), e.get('summary')) for e in self._element.findall('entry')]
         self.entries.sort(key=lambda e: e.value)
 
+    def __getitem__(self, index):
+        return self.entries[index]
+
     def __repr__(self):
         return f"{self.__class__.__name__}('{self.name}')"
 
@@ -375,7 +378,7 @@ class Interface:
         self.description = getattr(self._element.find('description'), 'text', "")
         self.summary = self._element.find('description').get('summary') if self.description else ""
 
-        self.enums = [Enum(self, element) for element in self._element.findall('enum')]
+        self.enums = {element.get('name'): Enum(self, element) for element in self._element.findall('enum')}
         self.events = [Event(self, element, opc) for opc, element in enumerate(self._element.findall('event'))]
         self.event_types = [event.name for event in self.events]
 
