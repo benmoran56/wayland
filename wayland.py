@@ -660,8 +660,9 @@ class Client:
         self.protocols.wayland.delete_interface(oid)
 
     def _wl_display_error_handler(self, oid: int, code: int, message: str):
-        # TODO: map this to the right interface/enum/entry
-        print("ERROR callback: ", oid, code, message)
+        error_enum = self.client_objects[oid].enums['error']
+        error_entry = error_enum.entries[code]
+        raise WaylandServerError(f"'{error_entry.name}': {error_entry.summary}; {message}.")
 
     def _wl_display_sync_handler(self, _unused):
         self._sync_done.set()
