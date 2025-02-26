@@ -442,7 +442,7 @@ class Protocol:
     def bind_interface(self, name: str) -> Interface:
         """Create an Interface instance & bind to a global object."""
         # find global match:
-        interface_global = self.client.global_objects[name]
+        interface_global = self.client.interface_global[name]
         # make client-side object:
         interface_instance = self.create_interface(name)
         _string = String(name).to_bytes()
@@ -467,7 +467,8 @@ class Protocol:
         oid = oid or next(self.client.oid_pool)
         interface = self._interface_classes[name](oid=oid)
         assert _debug_wayland(f"> {self}.create_interface: {interface}")
-        self.client.client_objects[oid] = interface
+        self.client.oid_interface[oid] = interface
+        self.client.interface_oid[name] = oid
         return interface
 
     def delete_interface(self, oid: int) -> None:
@@ -476,7 +477,8 @@ class Protocol:
         Args:
             oid: The object ID (oid) of the interface.
         """
-        interface = self.client.client_objects.pop(oid)
+        interface = self.client.oid_interface.pop(oid)
+        self.client.interface_oid.pop(interface.name)
         self.client.oid_pool.send(oid)      # to reuse later
         assert _debug_wayland(f"> {self}delete_interface: {interface}")
 
@@ -543,9 +545,10 @@ class Client:
         # Client side object ID generation:
         self.oid_pool = ObjectIDPool(minimum=1, maximum=0xfeffffff)
 
-        self.client_objects = {}    # oid: Interface
-        self.global_objects = {}    # interface_name: GlobalObject
-        self.global_mapping = {}    # global_name: interface_name
+        self.oid_interface = {}     # oid: Interface
+        self.interface_oid = {}     # interface_name: oid
+        self.interface_global = {}  # interface_name: GlobalObject
+        self.global_interface = {}  # global_name: interface_name
 
         self.protocol_dict = {p.name: p for p in [Protocol(self, filename) for filename in protocols]}
         self.protocols = _NameSpace(self.protocol_dict)
@@ -630,7 +633,7 @@ class Client:
             # - find the matching event by its header.opcode
             # - pass the raw payload into the event, which will decode it
             # TODO: handle "dead" interfaces:
-            interface = self.client_objects[header.oid]
+            interface = self.oid_interface[header.oid]
             event = interface.events[header.opcode]
             event(data[_header_len:header.size])
 
@@ -660,21 +663,26 @@ class Client:
         self.protocols.wayland.delete_interface(oid)
 
     def _wl_display_error_handler(self, oid: int, code: int, message: str):
-        error_enum = self.client_objects[oid].enums['error']
-        error_entry = error_enum.entries[code]
-        raise WaylandServerError(f"'{error_entry.name}': {error_entry.summary}; {message}.")
+        try:
+            error_enum = self.oid_interface[oid].enums['error']
+            error_entry = error_enum.entries[code]
+            raise WaylandServerError(f"'{error_entry.name}': {error_entry.summary}; {message}.")
+        except (IndexError, KeyError):
+            raise WaylandServerError(f"oid={oid}, code={code}, message={message}")
 
     def _wl_display_sync_handler(self, _unused):
         self._sync_done.set()
 
     def _wl_registry_global(self, name, interface, version):
         assert _debug_wayland(f"wl_registry global: {name}, {interface}, {version}")
-        self.global_objects[interface] = GlobalObject(name, interface, version)
-        self.global_mapping[name] = interface
+        self.interface_global[interface] = GlobalObject(name, interface, version)
+        self.global_interface[name] = interface
 
     def _wl_registry_global_remove(self, name):
         assert _debug_wayland(f"wl_registry global_remove: {name}")
-        interface_name = self.global_mapping[name]
-        del self.global_mapping[name]
-        del self.global_objects[interface_name]
-        # TODO: anything to do for previously created interfaces?
+        interface_name = self.global_interface[name]
+        del self.global_interface[name]
+        del self.interface_global[interface_name]
+        # TODO: test if this works:
+        oid = self.interface_oid.pop(interface_name)
+        del self.oid_interface[oid]
