@@ -33,21 +33,15 @@ assert _debug_wayland(f"version: {__version__}")
 class ObjectIDPool:
 
     def __init__(self, minimum: int, maximum: int):
-        self._sequence = _itertools.cycle(range(minimum, maximum))
+        self._sequence = iter(range(minimum, maximum + 1))
         self._recycle_pool = _deque()
 
-    def __next__(self):
+    def __next__(self) -> int:
         if self._recycle_pool:
             return self._recycle_pool.popleft()
+        return next(self._sequence)
 
-        oid = next(self._sequence)
-
-        while oid in self._recycle_pool:
-            oid = next(self._sequence)
-
-        return oid
-
-    def send(self, oid):
+    def send(self, oid: int):
         self._recycle_pool.append(oid)
 
 
@@ -284,7 +278,7 @@ class Enum:
         return self.entries[index]
 
     def __repr__(self):
-        return f"{self.__class__.__name__}('{self.name}')"
+        return f"{self.__class__.__name__}('{self.name}', entries={self.entries})"
 
 
 class Event:
@@ -510,8 +504,9 @@ class Client:
     the ``/usr/share/wayland*`` directories. At a minimum, the base Wayland
     protocol file (``wayland.xml``) is required.
 
-    When instantiated, the Client automatically creates the main Display
-    (``wl_display``) interface, which is available as ``Client.wl_display``.
+    When instantiated, the Client automatically connects to the socket and
+    creates the main Display (``wl_display``) interface, which is available
+    as ``Client.wl_display``.
     """
     def __init__(self, *protocols: str) -> None:
         """Create a Wayland Client connection.
