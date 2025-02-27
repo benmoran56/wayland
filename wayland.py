@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import abc
+import select
 import socket
-import itertools as _itertools
 import threading as _threading
 
 from struct import Struct
@@ -474,7 +474,7 @@ class Protocol:
         interface = self.client.oid_interface.pop(oid)
         self.client.interface_oid.pop(interface.name)
         self.client.oid_pool.send(oid)      # to reuse later
-        assert _debug_wayland(f"> {self}delete_interface: {interface}")
+        assert _debug_wayland(f"> {self}.delete_interface: {interface}")
 
     @property
     def interface_names(self) -> list[str]:
@@ -533,6 +533,8 @@ class Client:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
         self._sock.setblocking(False)
         self._sock.connect(path)
+        self._poll = select.poll()
+        self._poll.register(self._sock, select.POLLIN)
         self._recv_buffer = b""
 
         assert _debug_wayland(f"connected to: {self._sock.getpeername()}")
@@ -642,8 +644,11 @@ class Client:
             print("Unhandled ancillary data")
             # TODO: handle file descriptors and stuff
 
-    def poll(self) -> None:
-        self.receive()
+    def poll(self) -> bool:
+        """Return ``True`` if the server socket has pending data."""
+        if not self._poll.poll(0.0):
+            return False
+        return True
 
     def __del__(self) -> None:
         if hasattr(self, '_sock'):
