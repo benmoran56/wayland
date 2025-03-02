@@ -267,6 +267,9 @@ class Entry:
     def __and__(self, other) -> bool:
         return self.value & other > 0
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(name={self.name}, value={self.value})"
+
 
 class Enum:
     def __init__(self, interface, element):
