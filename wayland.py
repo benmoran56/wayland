@@ -6,7 +6,7 @@ import socket as _socket
 import threading as _threading
 
 from types import SimpleNamespace as _NameSpace
-from struct import Struct
+from struct import Struct as _Struct
 from collections import deque as _deque
 from collections import namedtuple as _namedtuple
 from collections import defaultdict as _defaultdict
@@ -16,7 +16,7 @@ from xml.etree.ElementTree import Element, ParseError
 
 from typing import Any
 
-__version__ = 0.9
+__version__ = 1.0
 
 debug = False
 
@@ -27,7 +27,6 @@ def _debug_wayland(message: str) -> bool:
 
 
 assert _debug_wayland(f"version: {__version__}")
-
 
 
 class ObjectIDPool:
@@ -70,7 +69,7 @@ class WaylandProtocolError(WaylandException, FileNotFoundError):
 ##################################
 
 class WaylandType(_abc.ABC):
-    struct: Struct
+    struct: _Struct
     length: int
     value: int | float | str | bytes
 
@@ -88,7 +87,7 @@ class WaylandType(_abc.ABC):
 
 
 class Int(WaylandType):
-    struct = Struct('i')
+    struct = _Struct('i')
     length = struct.size
 
     def __init__(self, value: int):
@@ -103,7 +102,7 @@ class Int(WaylandType):
 
 
 class UInt(WaylandType):
-    struct = Struct('I')
+    struct = _Struct('I')
     length = struct.size
 
     def __init__(self, value: int):
@@ -118,7 +117,7 @@ class UInt(WaylandType):
 
 
 class Fixed(WaylandType):
-    struct = Struct('I')
+    struct = _Struct('I')
     length = struct.size
 
     def __init__(self, value: int):
@@ -134,7 +133,7 @@ class Fixed(WaylandType):
 
 
 class String(WaylandType):
-    struct = Struct('I')
+    struct = _Struct('I')
 
     def __init__(self, text: str):
         # length uint + text length + 4byte rounding
@@ -155,7 +154,7 @@ class String(WaylandType):
 
 
 class Array(WaylandType):
-    struct = Struct('I')
+    struct = _Struct('I')
 
     def __init__(self, array: bytes):
         # length uint + text length + 4byte padding
@@ -175,7 +174,7 @@ class Array(WaylandType):
 
 
 class Header(WaylandType):
-    struct = Struct('IHH')
+    struct = _Struct('IHH')
     length = struct.size
 
     def __init__(self, oid, opcode, size):
@@ -279,7 +278,7 @@ class Enum:
         self.name = element.get('name')
         self.description = getattr(element.find('description'), 'text', "")
         self.summary = element.find('description').get('summary') if self.description else ""
-        self.bitfield = element.get('bitfield', False)
+        self.bitfield = True if element.get('bitfield') else False
         self.entries = [Entry(element) for element in self._element.findall('entry')]
         self.entries.sort(key=lambda e: e.value)
 
@@ -287,7 +286,7 @@ class Enum:
         return self.entries[index]
 
     def __repr__(self):
-        return f"{self.__class__.__name__}('{self.name}', entries={self.entries})"
+        return f"{self.__class__.__name__}('{self.name}', entries={len(self.entries)})"
 
 
 class Event:
@@ -302,14 +301,19 @@ class Event:
 
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
 
-    def __call__(self, payload):
+    def __call__(self, payload: bytes, fds: bytes) -> None:
         decoded_values = []
 
         for arg in self.arguments:
-            wl_type = arg.wl_type.from_bytes(payload)
-            decoded_values.append(wl_type.value)
-            # trim, and continue loop:
-            payload = payload[wl_type.length:]
+            if arg.wl_type == FD:
+                wl_type = arg.wl_type.from_bytes(fds)
+                decoded_values.append(wl_type.value)
+                fds = fds[wl_type.length:]
+            else:
+                wl_type = arg.wl_type.from_bytes(payload)
+                decoded_values.append(wl_type.value)
+                # trim, and continue loop:
+                payload = payload[wl_type.length:]
 
         # signature = tuple(f"{arg.name}={value}" for arg, value in zip(self.arguments, decoded_values))
         # print(f"Event({self.name}), arguments={signature}")
@@ -455,7 +459,7 @@ class Protocol:
         # Find a global match, and create a local instance for it.
         interface_global = self.client.globals[name][index]
         interface_instance = self.create_interface(name)
-        self.client._bound_globals[interface_global.name] = interface_instance
+        self.client.bound_globals[interface_global.name] = interface_instance
 
         # Inform the server of the new relationship:
         _string = String(name).to_bytes()
@@ -505,6 +509,7 @@ GlobalObject = _namedtuple('GlobalObject', 'name, interface, version')
 ##################################
 #           User API
 ##################################
+
 
 class Client:
     """Wayland Client
@@ -558,8 +563,8 @@ class Client:
         self._oid_interface_map: dict[int, Interface] = {}  # oid: Interface
 
         self.globals: dict[str, list] = _defaultdict(list)  # interface_name: [GlobalObject]
-        self._global_interface_map: dict[int, str] = {}     # global_name: interface_name
-        self._bound_globals: dict[int, Interface] = {}      # global_name: interface_instance
+        self.global_interface_map: dict[int, str] = {}     # global_name: interface_name
+        self.bound_globals: dict[int, Interface] = {}      # global_name: interface_instance
 
         self.protocol_dict = {p.name: p for p in [Protocol(self, filename) for filename in protocols]}
         self.protocols = _NameSpace(self.protocol_dict)
@@ -577,13 +582,16 @@ class Client:
         self.wl_registry.set_handler('global_remove', self._wl_registry_global_remove)
 
         self._sync_done = _threading.Event()
+        self._thread_running = _threading.Event()
 
         self._receive_thread = _threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
+        self._thread_running.wait()
 
     def _receive_loop(self):
         """A threaded method for continuously reading Server messages."""
-        while True:
+        self._thread_running.set()
+        while self._thread_running.is_set():
             self._receive()
 
     def sync(self):
@@ -628,6 +636,7 @@ class Client:
 
         # Include any leftover partial data:
         data = self._recv_buffer + new_data
+        fds = b"".join([fds for _, _, fds in ancdata])
 
         # Parse the events in chunks:
         while len(data) > _header_len:
@@ -637,6 +646,7 @@ class Client:
 
             # Do we have enough data for the full message?
             if len(data) < header.size:
+                print("WARNING! Pending FDS!", fds)
                 break
 
             # - find the matching object (interface) from the header.oid
@@ -645,17 +655,13 @@ class Client:
             # TODO: handle "dead" interfaces:
             interface = self._oid_interface_map[header.oid]
             event = interface.events[header.opcode]
-            event(data[_header_len:header.size])
+            event(data[_header_len:header.size], fds)
 
             # trim, and continue loop
             data = data[header.size:]
 
         # Keep leftover for next time:
         self._recv_buffer = data
-
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            print("Unhandled ancillary data")
-            # TODO: handle file descriptors and stuff
 
     def __del__(self) -> None:
         if hasattr(self, '_sock'):
@@ -683,13 +689,13 @@ class Client:
     def _wl_registry_global(self, global_name, interface_name, version):
         assert _debug_wayland(f"wl_registry global: {global_name}, {interface_name}, {version}")
         self.globals[interface_name].append(GlobalObject(global_name, interface_name, version))
-        self._global_interface_map[global_name] = interface_name
+        self.global_interface_map[global_name] = interface_name
 
     def _wl_registry_global_remove(self, global_name):
         assert _debug_wayland(f"wl_registry global_remove: {global_name}")
-        interface = self._global_interface_map.pop(global_name)
+        interface = self.global_interface_map.pop(global_name)
         self.globals[interface] = [g for g in self.globals[interface] if g.name != global_name]
 
-        if instance := self._bound_globals.pop(global_name, None):
+        if instance := self.bound_globals.pop(global_name, None):
             # TODO:
             pass
