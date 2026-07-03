@@ -1,0 +1,1 @@
+A Wayland client, in pure Python.

@@ -16,7 +16,7 @@ from xml.etree.ElementTree import Element, ParseError
 
 from typing import Any
 
-__version__ = 1.0
+__version__ = 1.1
 
 debug = False
 
@@ -138,7 +138,7 @@ class String(WaylandType):
     def __init__(self, text: str):
         # length uint + text length + 4byte rounding
         self.length = 4 + len(text) + (-len(text) % 4)
-        self.value = text
+        self.value: str = text
 
     def to_bytes(self) -> bytes:
         string_length = len(self.value) + 1
@@ -159,7 +159,7 @@ class Array(WaylandType):
     def __init__(self, array: bytes):
         # length uint + text length + 4byte padding
         self.length = 4 + len(array) + (-len(array) % 4)
-        self.value = array
+        self.value: bytes = array
 
     def to_bytes(self) -> bytes:
         length = len(self.value)
@@ -181,7 +181,7 @@ class Header(WaylandType):
         self.oid = oid
         self.opcode = opcode
         self.size = size
-        self.value = self.struct.pack(oid, opcode, size)
+        self.value: bytes = self.struct.pack(oid, opcode, size)
 
     def to_bytes(self) -> bytes:
         return self.value
@@ -380,7 +380,7 @@ class Interface:
     def __init__(self, oid: int):
         self.oid = oid
         self.name = self._element.get('name')
-        self.version = int(self._element.get('version'), 0)
+        self.version = int(self._element.get('version', 0))
 
         self.description = getattr(self._element.find('description'), 'text', "")
         self.summary = self._element.find('description').get('summary') if self.description else ""
