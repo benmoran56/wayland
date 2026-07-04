@@ -241,6 +241,7 @@ class Argument:
         self.name = element.get('name')
         self.type_name = element.get('type')
         self.wl_type = self._type_map[self.type_name]
+        self.wl_type_name = self.wl_type.__name__
         self.summary = element.get('summary')
         self.allow_null = True if element.get('allow-null') else False
 
@@ -254,7 +255,7 @@ class Argument:
         return self.wl_type.from_bytes(buffer)
 
     def __repr__(self) -> str:
-        return f"{self.name}: {self.wl_type.__name__}"
+        return f"{self.name}: {self.wl_type_name}"
 
 
 class Entry:
@@ -337,7 +338,6 @@ class Request:
         self.summary = element.find('description').get('summary') if self.description else ""
 
         self.arguments = [Argument(self, arg) for arg in element.findall('arg')]
-        # TODO: attempt to update a custom signature/annotations for the __call__ method.
 
     def _send(self, bytestring, fds) -> None:
         """Attach a Header to the payload, and send."""
@@ -392,6 +392,7 @@ class Interface:
         self.requests = [Request(self, elem, opcode) for opcode, elem in enumerate(self._element.findall('request'))]
         for request in self.requests:
             setattr(self, request.name, request)
+            request.__annotations__ = {a.name: a.wl_type_name for a in request.arguments}
 
         self._handlers = dict()
         for name in self.event_types:
@@ -483,7 +484,7 @@ class Protocol:
         oid = oid or next(self.client.oid_pool)
         interface = self._interface_classes[name](oid=oid)
         assert _debug_wayland(f"> {self}.create_interface: {interface}")
-        self.client._oid_interface_map[oid] = interface
+        self.client.oid_interface_map[oid] = interface
         return interface
 
     def delete_interface(self, oid: int) -> None:
@@ -492,7 +493,7 @@ class Protocol:
         Args:
             oid: The object ID (oid) of the interface.
         """
-        interface = self.client._oid_interface_map.pop(oid)
+        interface = self.client.oid_interface_map.pop(oid)
         self.client.oid_pool.send(oid)      # to reuse later
         assert _debug_wayland(f"> {self}.delete_interface: {interface}")
 
@@ -560,7 +561,7 @@ class Client:
         # Client side object ID generation:
         self.oid_pool = ObjectIDPool(minimum=1, maximum=0xfeffffff)
 
-        self._oid_interface_map: dict[int, Interface] = {}  # oid: Interface
+        self.oid_interface_map: dict[int, Interface] = {}  # oid: Interface
 
         self.globals: dict[str, list] = _defaultdict(list)  # interface_name: [GlobalObject]
         self.global_interface_map: dict[int, str] = {}     # global_name: interface_name
@@ -653,7 +654,7 @@ class Client:
             # - find the matching event by its header.opcode
             # - pass the raw payload into the event, which will decode it
             # TODO: handle "dead" interfaces:
-            interface = self._oid_interface_map[header.oid]
+            interface = self.oid_interface_map[header.oid]
             event = interface.events[header.opcode]
             event(data[_header_len:header.size], fds)
 
@@ -677,7 +678,7 @@ class Client:
 
     def _wl_display_error_handler(self, oid: int, code: int, message: str):
         try:
-            error_enum = self._oid_interface_map[oid].enums['error']
+            error_enum = self.oid_interface_map[oid].enums['error']
             error_entry = error_enum.entries[code]
             raise WaylandServerError(f"'{error_entry.name}': {error_entry.summary}; {message}.")
         except (IndexError, KeyError):
