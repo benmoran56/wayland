@@ -157,13 +157,13 @@ class Array(WaylandType):
 
     def __init__(self, array: bytes):
         # length uint + text length + 4byte padding
-        self.length = 4 + len(array) + (-len(array) % 4)
+        self.length = self.struct.size + len(array) + (-len(array) % 4)
         self.value: bytes = array
 
     def to_bytes(self) -> bytes:
         length = len(self.value)
-        padding_size = (4 - (length % 4))
-        return self.struct.pack(length) + b'\x00' * padding_size
+        padding_size = (-length) % 4
+        return self.struct.pack(length) + self.value + (b'\x00' * padding_size)
 
     @classmethod
     def from_bytes(cls, buffer: bytes) -> Array:
@@ -264,7 +264,7 @@ class Entry:
         self.summary = element.get('summary')
 
     def __and__(self, other) -> bool:
-        return self.value & other > 0
+        return (self.value & other) > 0
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name}, value={self.value})"
@@ -646,10 +646,10 @@ class Client:
         try:
             new_data, ancdata, msg_flags, _ = self._sock.recvmsg(4096, _socket.CMSG_SPACE(64))
         except ConnectionError:
-            raise WaylandSocketError(f"Socket is closed")
+            raise WaylandSocketError("Socket is closed")
 
         if new_data == b"":
-            raise WaylandSocketError(f"Socket is dead")
+            raise WaylandSocketError("Socket is dead")
 
         # Include any leftover partial data:
         data = self._recv_buffer + new_data
