@@ -5,7 +5,6 @@ import abc as _abc
 import socket as _socket
 import threading as _threading
 
-from types import SimpleNamespace as _NameSpace
 from struct import Struct as _Struct
 from collections import deque as _deque
 from collections import namedtuple as _namedtuple
@@ -16,7 +15,7 @@ from xml.etree.ElementTree import Element, ParseError
 
 from typing import Any
 
-__version__ = 1.1
+__version__ = 1.5
 
 debug = False
 
@@ -377,6 +376,12 @@ class Interface:
 
     _handlers: dict
 
+    def __getattr__(self, name: str) -> Request:
+        try:
+            return self.__dict__[name]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     def __init__(self, oid: int):
         self.oid = oid
         self.name = self._element.get('name')
@@ -411,6 +416,17 @@ class Interface:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(oid={self.oid}, opcode={self.opcode})"
+
+
+class Protocols:
+    def __init__(self, protocol_dict: dict[str, Protocol]) -> None:
+        self.__dict__.update(protocol_dict)
+
+    def __getattr__(self, name: str) -> Protocol:
+        try:
+            return self.__dict__[name]
+        except KeyError:
+            raise AttributeError(f"Unable to find Protocol '{name}', was the xml passed?")
 
 
 class Protocol:
@@ -564,11 +580,11 @@ class Client:
         self.oid_interface_map: dict[int, Interface] = {}  # oid: Interface
 
         self.globals: dict[str, list] = _defaultdict(list)  # interface_name: [GlobalObject]
-        self.global_interface_map: dict[int, str] = {}     # global_name: interface_name
-        self.bound_globals: dict[int, Interface] = {}      # global_name: interface_instance
+        self.global_interface_map: dict[int, str] = {}      # global_name: interface_name
+        self.bound_globals: dict[int, Interface] = {}       # global_name: interface_instance
 
         self.protocol_dict = {p.name: p for p in [Protocol(self, filename) for filename in protocols]}
-        self.protocols = _NameSpace(self.protocol_dict)
+        self.protocols = Protocols(self.protocol_dict)
 
         assert 'wayland' in self.protocol_dict, "You must provide at minimum a wayland.xml protocol file."
 
