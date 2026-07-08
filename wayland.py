@@ -300,15 +300,16 @@ class Event:
         self.summary = element.find('description').get('summary') if self.description else ""
 
         self.arguments = [Argument(self, element) for element in element.findall('arg')]
+        self.needs_fd = any(a.wl_type == FD for a in self.arguments)
 
-    def __call__(self, payload: bytes, fds: bytes) -> None:
+    def __call__(self, payload: bytes, fd: int | None) -> None:
         decoded_values = []
 
         for arg in self.arguments:
             if arg.wl_type == FD:
-                wl_type = arg.wl_type.from_bytes(fds)
-                decoded_values.append(wl_type.value)
-                fds = fds[wl_type.length:]
+                # The file descriptor is separately passed
+                # as an int, so no decoding is necessary:
+                decoded_values.append(fd)
             else:
                 wl_type = arg.wl_type.from_bytes(payload)
                 decoded_values.append(wl_type.value)
@@ -571,6 +572,7 @@ class Client:
         self._sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM, 0)
         self._sock.connect(path)
         self._recv_buffer = b""
+        self._recv_fds_queue = _deque()
 
         assert _debug_wayland(f"connected to: {self._sock.getpeername()}")
 
@@ -644,26 +646,26 @@ class Client:
         _header_len = Header.length
 
         try:
-            new_data, ancdata, msg_flags, _ = self._sock.recvmsg(4096, _socket.CMSG_SPACE(64))
+            new_data, fds, _flags, _addr = _socket.recv_fds(self._sock, 4096, maxfds=8)
+            # extend partial data from previous recv:
+            data = self._recv_buffer + new_data
+            self._recv_fds_queue.extend(fds)
         except ConnectionError:
             raise WaylandSocketError("Socket is closed")
 
         if new_data == b"":
             raise WaylandSocketError("Socket is dead")
 
-        # Include any leftover partial data:
-        data = self._recv_buffer + new_data
-        fds = b"".join([fds for _, _, fds in ancdata])
-
-        # Parse the events in chunks:
+        # Parse the events in chunks.
+        # First confirm we have enough data for a full header:
         while len(data) > _header_len:
 
-            # The first part of the data is the header:
+            # Then create a header from the data:
             header = Header.from_bytes(data[:_header_len])
 
             # Do we have enough data for the full message?
+            # If not, bail out for now until we receive more data:
             if len(data) < header.size:
-                print("WARNING! Pending FDS!", fds)
                 break
 
             # - find the matching object (interface) from the header.oid
@@ -672,12 +674,22 @@ class Client:
             # TODO: handle "dead" interfaces:
             interface = self.oid_interface_map[header.oid]
             event = interface.events[header.opcode]
-            event(data[_header_len:header.size], fds)
 
-            # trim, and continue loop
+            # If this event needs a file descriptor,
+            # don't proceed unless we have one in the queue:
+            if event.needs_fd and not self._recv_fds_queue:
+                break
+
+            # Split out the data for this event, and save the remainder:
+            event_data = data[_header_len:header.size]
             data = data[header.size:]
 
-        # Keep leftover for next time:
+            # Prepare a file descriptor if necessary:
+            fd = self._recv_fds_queue.popleft() if event.needs_fd else None
+            # Call the event:
+            event(payload=event_data, fd=fd)
+
+        # Keep leftover data for next time:
         self._recv_buffer = data
 
     def __del__(self) -> None:
