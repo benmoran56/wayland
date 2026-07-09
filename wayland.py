@@ -136,7 +136,7 @@ class String(WaylandType):
 
     def __init__(self, text: str):
         # length uint + text length + 4byte rounding
-        self.length = 4 + len(text) + (-len(text) % 4)
+        self.length = self.struct.size + len(text) + (-len(text) % 4)
         self.value: str = text
 
     def to_bytes(self) -> bytes:
@@ -510,9 +510,10 @@ class Protocol:
         Args:
             oid: The object ID (oid) of the interface.
         """
-        interface = self.client.oid_interface_map.pop(oid)
-        self.client.oid_pool.send(oid)      # to reuse later
-        assert _debug_wayland(f"> {self}.delete_interface: {interface}")
+        interface = self.client.oid_interface_map.pop(oid, None)
+        if interface is not None:
+            self.client.oid_pool.send(oid)      # to reuse later
+            assert _debug_wayland(f"> {self}.delete_interface: {interface}")
 
     @property
     def interface_names(self) -> list[str]:
@@ -569,7 +570,7 @@ class Client:
         if not _os.path.exists(path):
             raise WaylandSocketError(f"Wayland endpoint not found: {path}")
 
-        self._sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM, 0)
+        self._sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM | _socket.SOCK_CLOEXEC, 0)
         self._sock.connect(path)
         self._recv_buffer = b""
         self._recv_fds_queue = _deque()
@@ -605,13 +606,21 @@ class Client:
 
         self._receive_thread = _threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
-        self._thread_running.wait()
+        if not self._thread_running.wait(5.0):
+            raise WaylandSocketError("Receive thread failed to start")
 
     def _receive_loop(self):
         """A threaded method for continuously reading Server messages."""
         self._thread_running.set()
         while self._thread_running.is_set():
-            self._receive()
+            try:
+                self._receive()
+            except WaylandSocketError:
+                break
+            except OSError:
+                import traceback
+                traceback.print_exc()
+                break
 
     def sync(self):
         """Helper shortcut for wl_display.sync calls.
@@ -671,8 +680,12 @@ class Client:
             # - find the matching object (interface) from the header.oid
             # - find the matching event by its header.opcode
             # - pass the raw payload into the event, which will decode it
-            # TODO: handle "dead" interfaces:
-            interface = self.oid_interface_map[header.oid]
+            interface = self.oid_interface_map.get(header.oid)
+            if interface is None:
+                assert _debug_wayland(f"event for unknown object {header.oid}")
+                data = data[header.size:]
+                continue
+
             event = interface.events[header.opcode]
 
             # If this event needs a file descriptor,
@@ -726,5 +739,5 @@ class Client:
         self.globals[interface] = [g for g in self.globals[interface] if g.name != global_name]
 
         if instance := self.bound_globals.pop(global_name, None):
-            # TODO:
-            pass
+            self.oid_interface_map.pop(instance.oid, None)
+            self.oid_pool.send(instance.oid)
